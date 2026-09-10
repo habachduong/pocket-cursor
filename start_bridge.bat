@@ -7,11 +7,15 @@ if not exist ".venv\Scripts\python.exe" (
   echo Missing .venv. Recreate with: uv venv --python 3.12
   exit /b 1
 )
-echo Starting PocketCursor bridge...
-".venv\Scripts\python.exe" -X utf8 pocket_cursor.py
+echo Starting PocketCursor bridge (kill old instance if any)...
+REM Always restart: avoids "already running" when a previous bridge is still alive
+".venv\Scripts\python.exe" -X utf8 restart_pocket_cursor.py
 if errorlevel 1 (
   echo.
-  echo Bridge da dung. Neu bao thieu TELEGRAM_BOT_TOKEN, mo file .env va dan token vao dong TELEGRAM_BOT_TOKEN=
+  echo Bridge dung / loi. Xem dong ERROR phia tren:
+  echo  - TELEGRAM_BOT_TOKEN = thieu token trong file .env
+  echo  - CDP / Cursor       = chay start_cursor_cdp.bat truoc
+  echo  - Telegram API       = mang/timeout toi api.telegram.org
   pause
 )
 endlocal

@@ -3581,7 +3581,8 @@ def _check_single_instance():
             old_pid = int(_lock_file.read_text().strip())
             if _is_process_alive(old_pid):
                 print(f"ERROR: Bridge is already running (PID {old_pid}).")
-                print(f"Kill it first: taskkill /PID {old_pid} /F")
+                print("Dang chay san — khong can mo them.")
+                print(f"Restart: start_bridge.bat  (hoac: taskkill /PID {old_pid} /F roi mo lai)")
                 sys.exit(1)
             # Process is dead, stale lock file — proceed
         except (ValueError, OSError):
