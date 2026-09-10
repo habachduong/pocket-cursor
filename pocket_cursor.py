@@ -117,12 +117,53 @@ last_sent_lock = threading.Lock()
 last_tg_message_id = None  # Message ID of the last Telegram message (for reactions)
 pending_confirms = {}  # {short_key: {buttons_selector, buttons, orig_id}}
 pending_confirms_lock = threading.Lock()
+# Fingerprints of recently emitted approvals (monotonic time). Survives premature
+# pending_confirms clears so scan/monitor cannot re-send the same card twice.
+_recent_confirm_fps = {}
+_RECENT_CONFIRM_TTL = 120.0
 
 
 def _tg_confirm_key(tool_id):
     """Telegram callback_data is max 64 bytes. Keep btn_N:<key> well under that."""
     raw = (tool_id or 'pending').encode('utf-8')
     return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _prune_recent_confirms(now=None):
+    now = time.monotonic() if now is None else now
+    dead = [k for k, t0 in _recent_confirm_fps.items() if now - t0 > _RECENT_CONFIRM_TTL]
+    for k in dead:
+        _recent_confirm_fps.pop(k, None)
+
+
+def _confirm_already_tracked(confirm_key, tool_id, text_key):
+    """True if this approval was already reserved/sent (pending or recent TTL)."""
+    _prune_recent_confirms()
+    keys = [confirm_key, text_key]
+    if tool_id:
+        keys.append(tool_id)
+        keys.append(_tg_confirm_key(tool_id))
+    for k in keys:
+        if not k:
+            continue
+        if k in pending_confirms or k in _recent_confirm_fps:
+            return True
+    return False
+
+
+def _remember_confirm_fps(confirm_key, tool_id, text_key, rec):
+    """Index one pending record under every stable alias we might see later."""
+    now = time.monotonic()
+    pending_confirms[confirm_key] = rec
+    pending_confirms[text_key] = rec
+    _recent_confirm_fps[confirm_key] = now
+    _recent_confirm_fps[text_key] = now
+    if tool_id:
+        pending_confirms[tool_id] = rec
+        _recent_confirm_fps[tool_id] = now
+        tk = _tg_confirm_key(tool_id)
+        pending_confirms[tk] = rec
+        _recent_confirm_fps[tk] = now
 
 
 def _click_confirm_button(btns_selector, btn_index, btn_label='', orig_id=''):
@@ -194,46 +235,55 @@ FIND_PENDING_APPROVALS_JS = r"""
     const labelOf = (b) => ((b.innerText || b.getAttribute('aria-label') || '') + '')
         .replace(/\s*(Shift\+)?⏎\s*/g, ' ').replace(/\s+/g, ' ').trim();
     const isApproval = (b) => /^(Run|Skip|Allowlist|Allow list|Allow|Reject|Accept)\b/i.test(labelOf(b));
-    const clickables = () => Array.from(document.querySelectorAll('button, [role="button"]'));
-    const globalBtns = clickables().filter(b => !isMenu(b) && isApproval(b));
-    const cards = new Set();
-    document.querySelectorAll('.ui-shell-tool-call, [data-message-kind="tool"], .ui-tool-call-line, [data-tool-status]').forEach(el => {
-        const st = (el.getAttribute('data-tool-status') || '').toLowerCase();
-        const head = (el.innerText || '').slice(0, 500);
-        if (st && !/pend|wait|run|ask/.test(st) && !/pending approval/i.test(head) && !globalBtns.length) return;
-        cards.add(el.closest('.ui-shell-tool-call') || el.closest('[data-message-kind="tool"]') || el);
-    });
-    globalBtns.forEach(b => {
-        cards.add(b.closest('.ui-shell-tool-call') || b.closest('[data-message-kind="tool"]') || b.closest('.ui-tool-call-line') || b.parentElement);
+    const cardRoot = (el) => {
+        if (!el) return null;
+        return el.closest('[data-tool-call-id]')
+            || el.closest('.ui-shell-tool-call')
+            || el.closest('[data-message-kind="tool"]')
+            || null;
+    };
+    const cards = new Map(); // rootEl -> true
+    const addCard = (el) => {
+        const root = cardRoot(el) || (el && el.nodeType === 1 ? el : null);
+        if (root) cards.set(root, true);
+    };
+    document.querySelectorAll('.ui-shell-tool-call, [data-message-kind="tool"], [data-tool-call-id]').forEach(addCard);
+    document.querySelectorAll('button, [role="button"]').forEach(b => {
+        if (isMenu(b) || !isApproval(b)) return;
+        addCard(b);
     });
     const out = [];
-    const seen = new Set();
-    cards.forEach(card => {
-        if (!card) return;
-        let btns = Array.from(card.querySelectorAll('button, [role="button"]')).filter(b => !isMenu(b) && isApproval(b));
-        const head = (card.innerText || '').slice(0, 800);
-        const st = ((card.closest('[data-tool-status]') || card).getAttribute('data-tool-status') || '').toLowerCase();
-        const pending = /pending approval/i.test(head) || /pend|wait|ask/.test(st);
-        if (!btns.length && pending && globalBtns.length) btns = globalBtns;
+    const seenIds = new Set();
+    const seenText = new Set();
+    cards.forEach((_, card) => {
+        const btns = Array.from(card.querySelectorAll('button, [role="button"]'))
+            .filter(b => !isMenu(b) && isApproval(b));
         if (!btns.length) return;
         const raw = ((card.closest('[data-tool-call-id]') || card).getAttribute('data-tool-call-id') || '');
         const id = raw.split(/[\s\n]+/)[0].trim();
-        if (id && seen.has(id)) return;
-        if (id) seen.add(id);
         const d = card.querySelector('.ui-shell-tool-call__description');
         const cmd = card.querySelector('.ui-shell-tool-call__command, .ui-shell-tool-call__summary');
         const parts = [];
         if (d && d.textContent.trim()) parts.push(d.textContent.trim());
         if (cmd && cmd.textContent.trim()) parts.push(cmd.textContent.trim());
         if (!parts.length) {
+            const head = (card.innerText || '').slice(0, 800);
             const line = head.split('\n').map(s => s.trim()).filter(Boolean).slice(0, 4).join(' ');
             if (line) parts.push(line.slice(0, 240));
         }
+        const text = parts.join(' ') || 'Pending approval';
+        const textNorm = text.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 240);
+        if (id && seenIds.has(id)) return;
+        if (textNorm && seenText.has(textNorm)) return;
+        if (id) seenIds.add(id);
+        if (textNorm) seenText.add(textNorm);
         out.push({
-            id: id || ('approval-' + out.length),
-            text: parts.join(' ') || 'Pending approval',
+            id: id || ('txt:' + textNorm.slice(0, 48)),
+            text: text,
             selector: id ? ('[data-tool-call-id^="' + id + '"] .ui-shell-tool-call') : '.ui-shell-tool-call',
-            buttons_selector: id ? ('[data-tool-call-id^="' + id + '"] button, [data-tool-call-id^="' + id + '"] [role="button"]') : '.ui-shell-tool-call button',
+            buttons_selector: id
+                ? ('[data-tool-call-id^="' + id + '"] button, [data-tool-call-id^="' + id + '"] [role="button"]')
+                : '.ui-shell-tool-call button',
             buttons: btns.map((b, i) => ({ label: labelOf(b), index: i }))
         });
     });
@@ -242,27 +292,42 @@ FIND_PENDING_APPROVALS_JS = r"""
 """
 
 
+def _confirm_text_key(text):
+    """Stable fingerprint for approval text (scan vs monitor wording may differ slightly)."""
+    t = re.sub(r'\s+', ' ', (text or '').strip().lower())
+    # Prefer the shell/command body after $ if present
+    if '$ ' in t:
+        t = t.split('$ ', 1)[-1]
+    t = re.sub(
+        r'^(run command:|pending approval|action pending|shell|bash|powershell|cmd)\s*',
+        '', t)
+    # Drop common UI chrome that differs between extractors
+    t = re.sub(r'\b(run|skip|allowlist|allow list|allow|reject|accept)\b', ' ', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return _tg_confirm_key('txt:' + t[:240])
+
+
 def _emit_confirmation(cid, text, buttons, btns_selector, sec_selector, tool_id):
     """Send one pending Run/Skip card to Telegram. Returns True if newly emitted."""
-    tool_id = (tool_id or '').split()[0].strip()
-    # Prefer stable tool id; fall back to command text so scan+monitor don't double-send
-    # when one path lacks data-tool-call-id.
-    if not tool_id:
-        tool_id = 'txt:' + hashlib.sha256((text or '').encode('utf-8')).hexdigest()[:16]
+    raw_tool_id = (tool_id or '').split()[0].strip()
+    text_key = _confirm_text_key(text)
+    # Unstable / synthetic ids — key only by text so alternate extractors cannot double
+    if (not raw_tool_id or raw_tool_id.startswith('approval-')
+            or raw_tool_id.startswith('txt:') or raw_tool_id.startswith('gen:')):
+        tool_id = 'txt:' + text_key
+    else:
+        tool_id = raw_tool_id
     confirm_key = _tg_confirm_key(tool_id)
-    text_key = _tg_confirm_key('txt:' + re.sub(r'\s+', ' ', (text or '').strip().lower())[:240])
     with pending_confirms_lock:
-        if (confirm_key in pending_confirms or tool_id in pending_confirms
-                or text_key in pending_confirms):
+        if _confirm_already_tracked(confirm_key, tool_id, text_key):
             return False
-        pending_confirms[confirm_key] = {
+        rec = {
             'buttons_selector': btns_selector,
             'buttons': buttons,
             'orig_id': tool_id,
             'text_key': text_key,
         }
-        # Alias so a later emit with only text (or only id) hits the same card
-        pending_confirms[text_key] = pending_confirms[confirm_key]
+        _remember_confirm_fps(confirm_key, tool_id, text_key, rec)
 
     rule_result = command_rules.match(text) if COMMAND_RULES else None
     if rule_result == 'accept' and btns_selector:
@@ -281,7 +346,8 @@ def _emit_confirmation(cid, text, buttons, btns_selector, sec_selector, tool_id)
                     else:
                         tg_send(cid, f"✅ Auto: {text}")
                 with pending_confirms_lock:
-                    pending_confirms.pop(confirm_key, None)
+                    for k in (confirm_key, text_key, tool_id, _tg_confirm_key(tool_id)):
+                        pending_confirms.pop(k, None)
                 return True
 
     if muted or not cid:
@@ -454,10 +520,12 @@ def _dismiss_stale_confirms(live_ids, live_keys):
             rec.get('tg_chat_id'), rec.get('tg_message_id'),
             '✅ Đã chạy trên Cursor', rec.get('tg_caption'), rec.get('tg_photo'))
         with pending_confirms_lock:
-            pending_confirms.pop(key, None)
+            orig = rec.get('orig_id') or ''
             tk = rec.get('text_key')
-            if tk:
-                pending_confirms.pop(tk, None)
+            for k in (key, tk, orig, _tg_confirm_key(orig) if orig else None):
+                if k:
+                    pending_confirms.pop(k, None)
+            # Keep _recent_confirm_fps so the same card is not re-sent right after dismiss
 
 
 def tg_send(cid, text):
@@ -2269,8 +2337,12 @@ def sender_thread():
                     action, _, tool_id = cb_data.partition(':')
                     with pending_confirms_lock:
                         selectors = pending_confirms.pop(tool_id, None)
-                        if selectors and selectors.get('text_key'):
-                            pending_confirms.pop(selectors['text_key'], None)
+                        if selectors:
+                            orig = selectors.get('orig_id') or ''
+                            tk = selectors.get('text_key')
+                            for k in (tk, orig, _tg_confirm_key(orig) if orig else None):
+                                if k:
+                                    pending_confirms.pop(k, None)
                     print(f"[sender] Callback: action={action!r} tool_id={tool_id[:12]}... selectors={'found' if selectors else 'NONE'}")
 
                     if cb_data == 'noop':
@@ -3003,18 +3075,23 @@ def monitor_thread():
                 sec_selector = sec.get('selector') if isinstance(sec, dict) else None
 
                 if sec_type == 'confirmation':
-                    # Single send path — same as _scan_pending_approvals (avoids double Telegram msgs)
+                    # Sole Telegram sender is _scan_pending_approvals. Turn walk only
+                    # consumes the section so ordering continues (avoids double TG msgs
+                    # when tool_id / caption text differ between the two extractors).
                     tool_id = (sec_id or '').split()[0].strip() or (sec_key or '').split()[0].strip()
-                    emitted = _emit_confirmation(
-                        None if muted else cid,
-                        text,
-                        sec.get('buttons', []) if isinstance(sec, dict) else [],
-                        sec.get('buttons_selector', '') if isinstance(sec, dict) else '',
-                        sec_selector or '',
-                        tool_id,
+                    text_key = _confirm_text_key(text)
+                    confirm_key = (
+                        _tg_confirm_key(tool_id)
+                        if tool_id and not tool_id.startswith('gen:')
+                        else text_key
                     )
-                    if emitted:
-                        last_status_key = None
+                    with pending_confirms_lock:
+                        already = _confirm_already_tracked(confirm_key, tool_id, text_key)
+                    if already:
+                        print(f"[monitor] Confirmation already sent (scan): {text[:60]}")
+                    else:
+                        print(f"[monitor] Confirmation pending scan emit: {text[:60]}")
+                    last_status_key = None
 
                 elif not muted:
                     # Only send to Telegram when not muted
