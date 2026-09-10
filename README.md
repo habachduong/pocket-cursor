@@ -3,7 +3,7 @@
 **Your Cursor, from your phone. The conversation doesn't have to end.**
 
 > **Maintained fork** by [**Daniel Ha**](https://github.com/habachduong) · `duonghb@dataq.vn`  
-> Tested on **Cursor 3.19.13** (Windows). [What changed →](CHANGELOG.md)  
+> Tested on **Cursor 3.19.13** and **3.19.19** (Windows 11). [What changed →](CHANGELOG.md)  
 > Upstream: [qmHecker/pocket-cursor](https://github.com/qmHecker/pocket-cursor) (MIT)
 
 To some people Cursor is "just" an IDE. To others, it's a coworker, a sparring partner, someone you actually think with. When you step away from your computer, those conversations end.
@@ -12,7 +12,57 @@ PocketCursor keeps them going. It connects your running Cursor to Telegram on yo
 
 [▶ Watch the demo video](https://www.youtube.com/watch?v=hK7GIbRTzYo)
 
-**This fork (Daniel Ha)** — Cursor 3.19 Run/Skip on Telegram, hide buttons after the command already ran, catch up the latest turn when you switch windows, collapse duplicate Thought/Waiting, Windows Program Files + `.bat` launchers. Details in [CHANGELOG.md](CHANGELOG.md).
+**This fork (Daniel Ha)** — Cursor 3.19 Run/Skip on Telegram (no duplicate cards), hide buttons after the command already ran, catch up the latest turn when you switch windows, collapse duplicate Thought/Waiting, Windows 11 CDP after Cursor auto-update (`wmic` removal). Details in [CHANGELOG.md](CHANGELOG.md).
+
+## Windows quick start (Cursor 3.19.x)
+
+After a **Cursor update**, CDP often breaks because Cursor relaunches without debug flags, while background `Cursor.exe` processes keep running.
+
+1. Create a Telegram bot via [@BotFather](https://t.me/BotFather), copy the token.
+2. Configure:
+
+```bash
+cp .env.example .env
+# Set TELEGRAM_BOT_TOKEN=...
+```
+
+3. Install dependencies (once):
+
+```bash
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+npm install
+```
+
+4. **Launch Cursor with CDP** (force-kills any background Cursor, then starts with port 9222):
+
+```bat
+start_cursor_cdp.bat
+```
+
+Wait until you see `CDP OK`.
+
+5. **Start the bridge:**
+
+```bat
+start_bridge.bat
+```
+
+6. Message your bot on Telegram. It auto-pairs with the first user.
+
+**Manual CDP flags** (if you prefer a desktop shortcut):
+
+```
+--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=http://localhost:9222
+```
+
+> Closing all Cursor windows is **not** enough. Use `start_cursor_cdp.bat` or End task `Cursor` in Task Manager, then relaunch with the flags above.
+
+To restart only the bridge (one confirmation when Cursor asks):
+
+```bash
+python restart_pocket_cursor.py
+```
 
 ## What it's like to use
 
@@ -96,17 +146,19 @@ Auto-finds Cursor and launches with the right flags:
 python start_cursor.py
 ```
 
-**Windows:** Cursor is also detected under `C:\Program Files\cursor\`. If Cursor is already running *without* CDP, fully Exit it first, then:
+**Windows (recommended after Cursor updates to 3.19.x):**
 
 ```bat
 start_cursor_cdp.bat
 start_bridge.bat
 ```
 
+`start_cursor_cdp.bat` kills background `Cursor.exe` processes, then starts Cursor with CDP. Closing windows alone will not enable debugging.
+
 Or launch manually:
 
 ```
-cursor --remote-debugging-port=9222 --remote-allow-origins=http://localhost:9222
+cursor --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=http://localhost:9222
 ```
 
 > **Tip:** Edit your desktop shortcut to always include these flags so you don't have to remember them.
@@ -193,7 +245,7 @@ Then add `RENDER_LOCAL_DIR=/path/to/local/render` to your `.env`. When the netwo
 
 - **Python 3.10+**
 - **Node.js 18+** (for markdown-to-image rendering via Puppeteer)
-- **Cursor IDE 3.19+** (tested **3.19.13**) launched with `--remote-debugging-port=9222`
+- **Cursor IDE 3.19+** (tested **3.19.13** and **3.19.19** on Windows 11) launched with `--remote-debugging-port=9222`
 - **Telegram bot token** (free, via @BotFather)
 - **OpenAI API key** (optional, for voice transcription)
 - **ElevenLabs API key** (optional, for text-to-speech voice replies)

@@ -245,15 +245,24 @@ FIND_PENDING_APPROVALS_JS = r"""
 def _emit_confirmation(cid, text, buttons, btns_selector, sec_selector, tool_id):
     """Send one pending Run/Skip card to Telegram. Returns True if newly emitted."""
     tool_id = (tool_id or '').split()[0].strip()
+    # Prefer stable tool id; fall back to command text so scan+monitor don't double-send
+    # when one path lacks data-tool-call-id.
+    if not tool_id:
+        tool_id = 'txt:' + hashlib.sha256((text or '').encode('utf-8')).hexdigest()[:16]
     confirm_key = _tg_confirm_key(tool_id)
+    text_key = _tg_confirm_key('txt:' + re.sub(r'\s+', ' ', (text or '').strip().lower())[:240])
     with pending_confirms_lock:
-        if confirm_key in pending_confirms or tool_id in pending_confirms:
+        if (confirm_key in pending_confirms or tool_id in pending_confirms
+                or text_key in pending_confirms):
             return False
         pending_confirms[confirm_key] = {
             'buttons_selector': btns_selector,
             'buttons': buttons,
             'orig_id': tool_id,
+            'text_key': text_key,
         }
+        # Alias so a later emit with only text (or only id) hits the same card
+        pending_confirms[text_key] = pending_confirms[confirm_key]
 
     rule_result = command_rules.match(text) if COMMAND_RULES else None
     if rule_result == 'accept' and btns_selector:
@@ -420,8 +429,16 @@ def _remember_confirm_tg(confirm_key, tg_result, cid, caption, is_photo):
 def _dismiss_stale_confirms(live_ids, live_keys):
     """If Cursor no longer shows Run/Skip for a tracked card, hide the Telegram buttons."""
     stale = []
+    seen_recs = set()
     with pending_confirms_lock:
         for key, rec in list(pending_confirms.items()):
+            # Skip text-hash aliases (same dict as the primary confirm_key entry)
+            if rec.get('text_key') == key and key != _tg_confirm_key(rec.get('orig_id') or ''):
+                continue
+            rid = id(rec)
+            if rid in seen_recs:
+                continue
+            seen_recs.add(rid)
             if rec.get('dismissed') or not rec.get('tg_message_id'):
                 continue
             orig = rec.get('orig_id') or ''
@@ -438,6 +455,9 @@ def _dismiss_stale_confirms(live_ids, live_keys):
             '✅ Đã chạy trên Cursor', rec.get('tg_caption'), rec.get('tg_photo'))
         with pending_confirms_lock:
             pending_confirms.pop(key, None)
+            tk = rec.get('text_key')
+            if tk:
+                pending_confirms.pop(tk, None)
 
 
 def tg_send(cid, text):
@@ -2249,6 +2269,8 @@ def sender_thread():
                     action, _, tool_id = cb_data.partition(':')
                     with pending_confirms_lock:
                         selectors = pending_confirms.pop(tool_id, None)
+                        if selectors and selectors.get('text_key'):
+                            pending_confirms.pop(selectors['text_key'], None)
                     print(f"[sender] Callback: action={action!r} tool_id={tool_id[:12]}... selectors={'found' if selectors else 'NONE'}")
 
                     if cb_data == 'noop':
@@ -2981,85 +3003,18 @@ def monitor_thread():
                 sec_selector = sec.get('selector') if isinstance(sec, dict) else None
 
                 if sec_type == 'confirmation':
-                    # Always track confirmation selectors; send keyboard only when not muted
-                    tool_id = (sec_id or '').split()[0].strip()
-                    confirm_key = _tg_confirm_key(tool_id)
-                    with pending_confirms_lock:
-                        if confirm_key in pending_confirms or tool_id in pending_confirms:
-                            # Already tracked this confirmation
-                            if sec_key:
-                                forwarded_ids.add(sec_key)
-                            section_stable.pop(sec_key, None)
-                            continue
-                    buttons = sec.get('buttons', [])
-                    btns_selector = sec.get('buttons_selector', '')
-                    with pending_confirms_lock:
-                        pending_confirms[confirm_key] = {
-                            'buttons_selector': btns_selector,
-                            'buttons': buttons,
-                            'orig_id': tool_id,
-                        }
-
-                    # Auto-accept: check command text against allow/deny rules
-                    rule_result = command_rules.match(text) if COMMAND_RULES else None
-                    if rule_result == 'accept' and btns_selector:
-                        accept_idx, accept_label = command_rules.find_accept_button(buttons)
-                        if accept_idx is not None:
-                            # Screenshot BEFORE click (click changes DOM)
-                            png = cdp_screenshot_element(sec_selector) if sec_selector else None
-                            click_result = _click_confirm_button(
-                                btns_selector, accept_idx, accept_label or 'Run', tool_id or ''
-                            )
-                            if click_result and click_result.strip() == 'OK':
-                                print(f"[command-rules] Auto-accepted: {text} -> {accept_label}")
-                                if not muted and cid:
-                                    if png:
-                                        tg_send_photo_bytes(cid, png, filename='auto_accept.png',
-                                                            caption=f"✅ Auto: {text}")
-                                    else:
-                                        tg_send(cid, f"✅ Auto: {text}")
-                                with pending_confirms_lock:
-                                    pending_confirms.pop(confirm_key, None)
-                                    pending_confirms.pop(tool_id, None)
-                                if sec_key:
-                                    forwarded_ids.add(sec_key)
-                                section_stable.pop(sec_key, None)
-                                continue
-                            else:
-                                print(f"[command-rules] Auto-accept click failed ({click_result}), falling back to keyboard")
-
-                    if not muted:
+                    # Single send path — same as _scan_pending_approvals (avoids double Telegram msgs)
+                    tool_id = (sec_id or '').split()[0].strip() or (sec_key or '').split()[0].strip()
+                    emitted = _emit_confirmation(
+                        None if muted else cid,
+                        text,
+                        sec.get('buttons', []) if isinstance(sec, dict) else [],
+                        sec.get('buttons_selector', '') if isinstance(sec, dict) else '',
+                        sec_selector or '',
+                        tool_id,
+                    )
+                    if emitted:
                         last_status_key = None
-                        tg_typing(cid)
-                        png = None
-                        if sec_selector:
-                            png = cdp_screenshot_element(sec_selector)
-                        keyboard = []
-                        for btn in buttons:
-                            label = (btn.get('label') or f"Button {btn.get('index', 0)}")[:64]
-                            keyboard.append([{
-                                'text': label or 'Run',
-                                'callback_data': f"btn_{btn['index']}:{confirm_key}"
-                            }])
-                        sent_ok = False
-                        caption = f"⚡ {text}"
-                        if png:
-                            print(f"[monitor] Forwarding CONFIRMATION with keyboard: {text}")
-                            photo_result = tg_send_photo_bytes_with_keyboard(cid, png, keyboard,
-                                filename='confirmation.png', caption=caption)
-                            sent_ok = bool(photo_result and photo_result.get('ok'))
-                            if sent_ok:
-                                _remember_confirm_tg(confirm_key, photo_result, cid, caption, True)
-                        if not sent_ok:
-                            print(f"[monitor] Forwarding CONFIRMATION as text: {text}")
-                            result = tg_call('sendMessage', chat_id=cid, text=caption,
-                                    reply_markup={'inline_keyboard': keyboard})
-                            sent_ok = bool(result.get('ok'))
-                            if sent_ok:
-                                _remember_confirm_tg(confirm_key, result, cid, caption, False)
-                        if not sent_ok:
-                            print("[monitor] Confirmation keyboard rejected, sending text only")
-                            tg_send(cid, f"⚡ {text}\n\nBấm Run/Skip trên Cursor (Telegram không nhận được nút).")
 
                 elif not muted:
                     # Only send to Telegram when not muted

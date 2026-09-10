@@ -55,6 +55,7 @@ Testing:
     python start_cursor.py --check
 """
 
+import json
 import re
 import socket
 import subprocess
@@ -64,6 +65,36 @@ import time
 from pathlib import Path
 
 BASE_PORT = 9222
+
+
+def port_is_open(port):
+    """Check if a port is already listening (bound)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        return s.connect_ex(('127.0.0.1', port)) == 0
+
+
+def verify_cdp(port, timeout=15):
+    """Poll the CDP endpoint until it responds or timeout is reached.
+
+    With timeout=0, performs a single instant check (no polling).
+    """
+    import urllib.request
+    import urllib.error
+
+    url = f'http://127.0.0.1:{port}/json'
+    deadline = time.time() + timeout
+
+    while True:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                if resp.status == 200:
+                    return True
+        except (urllib.error.URLError, ConnectionRefusedError, OSError, TimeoutError):
+            pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(1)
 
 
 def find_cursor():
@@ -106,19 +137,58 @@ def find_cursor():
     return None
 
 
-def is_cursor_running():
-    """Check if any Cursor process is running."""
-    if sys.platform == 'win32':
+def _win_cursor_processes():
+    """List Cursor.exe processes on Windows without wmic (removed on Win11).
+
+    Returns list of dicts: {'pid': int, 'cmd': str}
+    """
+    try:
+        result = subprocess.run(
+            [
+                'powershell', '-NoProfile', '-Command',
+                "Get-CimInstance Win32_Process -Filter \"Name='Cursor.exe'\" |"
+                " Select-Object ProcessId, CommandLine |"
+                " ConvertTo-Json -Compress"
+            ],
+            capture_output=True, text=True, encoding='utf-8',
+            errors='replace', timeout=25
+        )
+        raw = (result.stdout or '').strip()
+        if not raw:
+            return []
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            data = [data]
+        out = []
+        for row in data:
+            pid = row.get('ProcessId')
+            cmd = row.get('CommandLine') or ''
+            if pid is not None:
+                out.append({'pid': int(pid), 'cmd': cmd})
+        return out
+    except Exception:
+        # Last resort: tasklist (no command line)
         try:
             result = subprocess.run(
-                ['wmic', 'process', 'where', "name='Cursor.exe'",
-                 'get', 'processid'],
+                ['tasklist', '/FI', 'IMAGENAME eq Cursor.exe', '/FO', 'CSV', '/NH'],
                 capture_output=True, text=True, encoding='utf-8',
                 errors='replace', timeout=15
             )
-            return any(line.strip().isdigit() for line in result.stdout.splitlines())
+            out = []
+            for line in result.stdout.splitlines():
+                # "Cursor.exe","1234",...
+                parts = [p.strip().strip('"') for p in line.split(',')]
+                if len(parts) >= 2 and parts[0].lower() == 'cursor.exe' and parts[1].isdigit():
+                    out.append({'pid': int(parts[1]), 'cmd': ''})
+            return out
         except Exception:
-            return False
+            return []
+
+
+def is_cursor_running():
+    """Check if any Cursor process is running."""
+    if sys.platform == 'win32':
+        return bool(_win_cursor_processes())
     else:
         try:
             result = subprocess.run(
@@ -130,23 +200,18 @@ def is_cursor_running():
 
 
 def get_used_ports():
-    """Find CDP ports already in use by running Cursor instances."""
+    """Find CDP ports already in use by running Cursor instances.
+
+    Prefer ports that actually answer /json — command-line flags alone can lie
+    after a bad merge (flags present, CDP never bound).
+    """
     used = set()
 
     if sys.platform == 'win32':
-        try:
-            result = subprocess.run(
-                ['wmic', 'process', 'where', "name='Cursor.exe'",
-                 'get', 'commandline'],
-                capture_output=True, text=True, encoding='utf-8',
-                errors='replace', timeout=15
-            )
-            for match in re.findall(r'--remote-debugging-port=(\d+)', result.stdout):
+        for proc in _win_cursor_processes():
+            for match in re.findall(r'--remote-debugging-port=(\d+)', proc.get('cmd') or ''):
                 used.add(int(match))
-        except Exception:
-            pass
     else:
-        # Linux / macOS
         try:
             result = subprocess.run(
                 ['ps', 'aux'], capture_output=True, text=True, timeout=10
@@ -158,14 +223,16 @@ def get_used_ports():
         except Exception:
             pass
 
-    return sorted(used)
-
-
-def port_is_open(port):
-    """Check if a port is already listening (bound)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(1)
-        return s.connect_ex(('localhost', port)) == 0
+    # Also discover live CDP endpoints even if cmdline parsing missed them
+    live = []
+    candidates = sorted(used) or list(range(BASE_PORT, BASE_PORT + 10))
+    for port in candidates:
+        if verify_cdp(port, timeout=0):
+            live.append(port)
+    # If cmdline claimed ports but none live, return empty so caller treats as no-CDP
+    if used and not live:
+        return []
+    return live if live else sorted(used)
 
 
 def find_available_port(exclude=None, quiet=False):
@@ -192,36 +259,13 @@ def count_page_targets(port):
     import urllib.request
     import json as _json
     try:
-        with urllib.request.urlopen(f'http://localhost:{port}/json', timeout=3) as resp:
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/json', timeout=3) as resp:
             targets = _json.loads(resp.read())
             return sum(1 for t in targets if t.get('type') == 'page'
                        and (t.get('url', '').startswith('vscode-file://')
                             or 'Cursor' in t.get('title', '')))
     except Exception:
         return 0
-
-
-def verify_cdp(port, timeout=15):
-    """Poll the CDP endpoint until it responds or timeout is reached.
-    
-    With timeout=0, performs a single instant check (no polling).
-    """
-    import urllib.request
-    import urllib.error
-
-    url = f'http://localhost:{port}/json'
-    deadline = time.time() + timeout
-
-    while True:
-        try:
-            with urllib.request.urlopen(url, timeout=2) as resp:
-                if resp.status == 200:
-                    return True
-        except (urllib.error.URLError, ConnectionRefusedError, OSError):
-            pass
-        if time.time() >= deadline:
-            return False
-        time.sleep(1)
 
 
 def main():
@@ -238,7 +282,7 @@ def main():
             print("Expected: 'cursor' in PATH or /usr/bin/cursor")
         print()
         print("If Cursor is installed elsewhere, launch it manually with:")
-        print("  cursor --remote-debugging-port=9222 --remote-allow-origins=http://localhost:9222")
+        print("  cursor --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=http://localhost:9222")
         sys.exit(1)
 
     # --check mode: just report status, don't launch anything
@@ -250,7 +294,9 @@ def main():
             print(f"Windows: {targets}")
             sys.exit(0)
         elif is_cursor_running():
-            print("Cursor is running but without CDP.")
+            n = len(_win_cursor_processes()) if sys.platform == 'win32' else '?'
+            print(f"Cursor is running in the background ({n} process(es)) but WITHOUT CDP.")
+            print("Closing windows is not enough — use start_cursor_cdp.bat to kill + relaunch.")
             sys.exit(1)
         else:
             print("Cursor is not running.")
@@ -264,16 +310,18 @@ def main():
         # Cursor is running but WITHOUT CDP. New windows would merge into
         # the existing process and our CDP flags would be ignored.
         # We can't kill Cursor automatically — user may have unsaved work.
-        print("Cursor is running, but without CDP enabled.")
-        print("New windows will join the existing process, so CDP cannot be added.")
+        print("Cursor is still running in the background (closing windows is NOT enough).")
+        print("CDP is NOT enabled on that process — PocketCursor cannot attach.")
         print()
-        print("To fix this:")
-        print("  1. Save your work and close all Cursor windows")
-        print("  2. Run this script again")
+        print("Fix:")
+        print("  1. Save your work")
+        print("  2. Run:  start_cursor_cdp.bat")
+        print("     (it force-kills all Cursor.exe, then relaunches with CDP)")
         print()
-        print("To avoid this in the future, always launch Cursor via this script")
-        print("or add these flags to your desktop shortcut:")
-        print("  --remote-debugging-port=9222 --remote-allow-origins=http://localhost:9222")
+        print("Or manually: Task Manager → End task \"Cursor\", then run this script again.")
+        print()
+        print("Shortcut flags (after update, Start Menu may lose them):")
+        print("  --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=http://localhost:9222")
         sys.exit(1)
 
     if existing_ports:
@@ -296,6 +344,7 @@ def main():
         args = [
             cursor_path,
             f'--remote-debugging-port={new_port}',
+            f'--remote-debugging-address=127.0.0.1',
             f'--remote-allow-origins=http://localhost:{new_port}',
         ]
         if sys.platform == 'win32':
@@ -346,6 +395,7 @@ def main():
         args = [
             cursor_path,
             f'--remote-debugging-port={port}',
+            f'--remote-debugging-address=127.0.0.1',
             f'--remote-allow-origins=http://localhost:{port}',
         ]
 

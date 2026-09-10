@@ -1,6 +1,6 @@
 # Changelog
 
-Fork maintained by **Daniel Ha** (`duonghb@dataq.vn`).
+Fork maintained by **Daniel Ha** (`duonghb@dataq.vn`) · GitHub: [habachduong/pocket-cursor](https://github.com/habachduong/pocket-cursor)
 
 Upstream: [qmHecker/pocket-cursor](https://github.com/qmHecker/pocket-cursor) (MIT).
 
@@ -8,9 +8,20 @@ Upstream: [qmHecker/pocket-cursor](https://github.com/qmHecker/pocket-cursor) (M
 
 | Cursor IDE | Status | Notes |
 |---|---|---|
-| **3.19.x** (tested **3.19.13**) | Supported | Current target. Agent transcript, Run/Skip, thinking headers. |
-| 3.18 and older | Partial | Legacy `[data-click-ready]` confirmations still work; 3.19 DOM is the main path. |
-| Newer than 3.19 | Best-effort | UI class names change often — report issues with Cursor version. |
+| **3.19.x** (tested **3.19.13**, **3.19.19**) | Supported | Agent transcript DOM, Run/Skip, Windows CDP after update |
+| 3.18 and older | Partial | Legacy `[data-click-ready]` still works; 3.19 DOM is the main path |
+| Newer than 3.19 | Best-effort | UI class names change often — report issues with Cursor version |
+
+## Windows: CDP after Cursor update (3.19.19+)
+
+**Problem:** After Cursor updates itself, it often relaunches **without** `--remote-debugging-port`. Closing editor windows is **not** enough — dozens of `Cursor.exe` processes keep running in the background. On **Windows 11**, `wmic` was removed, so the old launcher thought Cursor was not running, opened a second window, and CDP never attached.
+
+**Fix (this fork):**
+- Detect Cursor via PowerShell `Get-CimInstance` (no `wmic`)
+- Treat “flags in command line but `/json` dead” as **no CDP**
+- `start_cursor_cdp.bat` force-kills all `Cursor.exe`, then launches with:
+  `--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=http://localhost:9222`
+- Clear messages: closing windows ≠ quitting Cursor
 
 ## Fork improvements — Daniel Ha
 
@@ -24,9 +35,10 @@ Upstream: [qmHecker/pocket-cursor](https://github.com/qmHecker/pocket-cursor) (M
 ### Confirmations on Telegram
 
 - Short hash keys for inline buttons (`BUTTON_DATA_INVALID` fix).
-- If Telegram rejects the keyboard, still send the command as text.
+- Single send path for approvals (scan + monitor) to avoid **duplicate** Run/Skip messages.
+- Dedup by tool id and command text.
 - After Run on Telegram **or** on the PC, remove Run/Skip and mark the message ✅ / ⏭.
-- Pressing Run when Cursor already executed shows “Đã chạy trên Cursor” and hides the buttons.
+- Pressing Run when Cursor already executed shows “already ran” and hides the buttons.
 
 ### Multi-window chats
 
@@ -39,7 +51,7 @@ Upstream: [qmHecker/pocket-cursor](https://github.com/qmHecker/pocket-cursor) (M
 
 ### Windows
 
-- Find Cursor in `C:\Program Files\cursor\` as well as `%LOCALAppData%`.
+- Find Cursor in `C:\Program Files\cursor\` as well as `%LOCALAPPDATA%`.
 - `start_bridge.bat` / `start_cursor_cdp.bat` for local Python venv + Node on PATH.
 - CDP reconnect when the eval WebSocket drops (`socket is already closed`).
 - Bridge stays up if CDP is missing at start (Telegram poller still runs).

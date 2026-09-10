@@ -26,13 +26,17 @@ POCKET_CURSOR_SCRIPT = SCRIPT_DIR / 'pocket_cursor.py'
 
 
 def find_pids():
-    """Find PIDs of running PocketCursor processes via wmic."""
+    """Find PIDs of running PocketCursor processes (no wmic — gone on Win11)."""
     try:
         result = subprocess.run(
-            ['wmic', 'process', 'where',
-             "commandline like '%pocket_cursor.py%' and not commandline like '%wmic%' and not commandline like '%restart%'",
-             'get', 'processid'],
-            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15
+            [
+                'powershell', '-NoProfile', '-Command',
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.CommandLine -like '*pocket_cursor.py*' "
+                "-and $_.CommandLine -notlike '*restart_pocket_cursor*' } | "
+                "Select-Object -ExpandProperty ProcessId"
+            ],
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=20
         )
         pids = []
         for line in result.stdout.strip().splitlines():
