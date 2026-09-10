@@ -35,6 +35,8 @@ node_modules/
 package-lock.json
 
 # Python
+.venv/
+venv/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -46,7 +48,10 @@ __pycache__/
 *.swo
 *~
 
-# OS
-.DS_Store
+# Local Cursor rule copy (absolute machine path). Template: pocket-cursor.mdc
+.cursor/rules/pocket-cursor.mdc
+
+# Local tooling (portable gh, etc.)
+.tools/
 Thumbs.db
 Desktop.ini

@@ -2,11 +2,17 @@
 
 **Your Cursor, from your phone. The conversation doesn't have to end.**
 
+> **Maintained fork** by [**Daniel Ha**](https://github.com/duonghb53) · `duonghb@dataq.vn`  
+> Tested on **Cursor 3.19.13** (Windows). [What changed →](CHANGELOG.md)  
+> Upstream: [qmHecker/pocket-cursor](https://github.com/qmHecker/pocket-cursor) (MIT)
+
 To some people Cursor is "just" an IDE. To others, it's a coworker, a sparring partner, someone you actually think with. When you step away from your computer, those conversations end.
 
 PocketCursor keeps them going. It connects your running Cursor to Telegram on your phone. Everything mirrors both ways. Not a remote agent. Not a cloud service. YOUR Cursor, wherever you are.
 
 [▶ Watch the demo video](https://www.youtube.com/watch?v=hK7GIbRTzYo)
+
+**This fork (Daniel Ha)** — Cursor 3.19 Run/Skip on Telegram, hide buttons after the command already ran, catch up the latest turn when you switch windows, collapse duplicate Thought/Waiting, Windows Program Files + `.bat` launchers. Details in [CHANGELOG.md](CHANGELOG.md).
 
 ## What it's like to use
 
@@ -88,6 +94,13 @@ Auto-finds Cursor and launches with the right flags:
 
 ```bash
 python start_cursor.py
+```
+
+**Windows:** Cursor is also detected under `C:\Program Files\cursor\`. If Cursor is already running *without* CDP, fully Exit it first, then:
+
+```bat
+start_cursor_cdp.bat
+start_bridge.bat
 ```
 
 Or launch manually:
@@ -180,10 +193,19 @@ Then add `RENDER_LOCAL_DIR=/path/to/local/render` to your `.env`. When the netwo
 
 - **Python 3.10+**
 - **Node.js 18+** (for markdown-to-image rendering via Puppeteer)
-- **Cursor IDE** launched with `--remote-debugging-port=9222`
+- **Cursor IDE 3.19+** (tested **3.19.13**) launched with `--remote-debugging-port=9222`
 - **Telegram bot token** (free, via @BotFather)
 - **OpenAI API key** (optional, for voice transcription)
 - **ElevenLabs API key** (optional, for text-to-speech voice replies)
+
+## Maintainers
+
+| | |
+|---|---|
+| **This fork** | [Daniel Ha](https://github.com/duonghb53) · `duonghb@dataq.vn` |
+| **Original** | [Michael Hecker / qmHecker](https://github.com/qmHecker/pocket-cursor) |
+
+Issues and PRs for Cursor 3.19 / Windows: open them on **this fork**. Upstream remains the original project.
 
 ## License
 

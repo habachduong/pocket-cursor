@@ -8,6 +8,10 @@ Mirrors conversations between Cursor and Telegram in both directions:
 Connects to Cursor via Chrome DevTools Protocol (CDP).
 
 Usage: python -X utf8 pocket_cursor.py
+
+Cursor 3.19+ / Windows compatibility (this fork):
+  Daniel Ha <duonghb@dataq.vn>
+  https://github.com/duonghb53/pocket-cursor
 """
 
 import sys, io
@@ -18,6 +22,7 @@ if sys.platform == 'win32' and hasattr(sys.stdout, 'buffer'):
 # Standard library
 import atexit
 import base64
+import hashlib
 import json
 import os
 import re
@@ -46,10 +51,23 @@ print = ts_print
 
 env_path = Path(__file__).parent / '.env'
 if env_path.exists():
-    for line in env_path.read_text().strip().splitlines():
-        if '=' in line and not line.startswith('#'):
-            key, val = line.split('=', 1)
-            os.environ[key.strip()] = val.strip()
+    raw = env_path.read_bytes()
+    for enc in ('utf-8-sig', 'utf-8', 'utf-16', 'utf-16-le', 'cp1252'):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode('utf-8', errors='replace')
+    for line in text.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, val = line.split('=', 1)
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        if key:
+            os.environ[key] = val
 
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not TOKEN:
@@ -97,8 +115,233 @@ phone_outbox = Path(__file__).parent / '_phone_outbox'
 last_sent_text = None  # Last message sent by the sender thread
 last_sent_lock = threading.Lock()
 last_tg_message_id = None  # Message ID of the last Telegram message (for reactions)
-pending_confirms = {}  # {tool_call_id: {buttons_selector, buttons: [{label, index}]}} for inline keyboards
+pending_confirms = {}  # {short_key: {buttons_selector, buttons, orig_id}}
 pending_confirms_lock = threading.Lock()
+
+
+def _tg_confirm_key(tool_id):
+    """Telegram callback_data is max 64 bytes. Keep btn_N:<key> well under that."""
+    raw = (tool_id or 'pending').encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _click_confirm_button(btns_selector, btn_index, btn_label='', orig_id=''):
+    """Click a Cursor approval button. Tries CSS index then label, on every CDP window."""
+    js = """
+        (function() {
+            const sel = __SEL__;
+            const label = __LABEL__;
+            const orig = __ORIG__;
+            const idx = __IDX__;
+            const isMenu = (b) => {
+                const p = b.getAttribute('aria-haspopup');
+                return p === 'menu' || p === 'true' || p === 'listbox';
+            };
+            const norm = (b) => ((b.innerText || b.getAttribute('aria-label') || '') + '').replace(/\\s+/g, ' ').trim();
+            let btns = [];
+            try { btns = Array.from(document.querySelectorAll(sel)).filter(b => !isMenu(b)); } catch (e) {}
+            if (btns[idx]) { btns[idx].click(); return 'OK'; }
+            const roots = orig
+                ? Array.from(document.querySelectorAll('[data-tool-call-id^="' + orig + '"]'))
+                : [];
+            if (!roots.length) roots.push(document);
+            const want = String(label || '').toLowerCase();
+            const wantWord = want.split(' ')[0];
+            for (const root of roots) {
+                for (const b of root.querySelectorAll('button')) {
+                    if (isMenu(b)) continue;
+                    const t = norm(b);
+                    if (!t) continue;
+                    const tl = t.toLowerCase();
+                    if (t === label || (want && tl.startsWith(want)) || (wantWord && tl.startsWith(wantWord))) {
+                        b.click();
+                        return 'OK-label';
+                    }
+                }
+            }
+            return 'ERROR: button not found (' + btns.length + ')';
+        })();
+    """.replace('__SEL__', json.dumps(btns_selector or '')) \
+       .replace('__LABEL__', json.dumps(btn_label or '')) \
+       .replace('__ORIG__', json.dumps(orig_id or '')) \
+       .replace('__IDX__', str(int(btn_index)))
+
+    conns = []
+    ac = active_conn()
+    if ac is not None:
+        conns.append(ac)
+    for info in instance_registry.values():
+        w = info.get('ws')
+        if w is not None and w not in conns:
+            conns.append(w)
+    last = None
+    for c in conns:
+        try:
+            last = cdp_eval_on(c, js)
+            if last and str(last).startswith('OK'):
+                return last
+        except Exception as e:
+            last = f'ERROR: {e}'
+    return last
+
+
+FIND_PENDING_APPROVALS_JS = r"""
+(function() {
+    const isMenu = (b) => {
+        const p = b.getAttribute('aria-haspopup');
+        return p === 'menu' || p === 'true' || p === 'listbox';
+    };
+    const labelOf = (b) => ((b.innerText || b.getAttribute('aria-label') || '') + '')
+        .replace(/\s*(Shift\+)?⏎\s*/g, ' ').replace(/\s+/g, ' ').trim();
+    const isApproval = (b) => /^(Run|Skip|Allowlist|Allow list|Allow|Reject|Accept)\b/i.test(labelOf(b));
+    const clickables = () => Array.from(document.querySelectorAll('button, [role="button"]'));
+    const globalBtns = clickables().filter(b => !isMenu(b) && isApproval(b));
+    const cards = new Set();
+    document.querySelectorAll('.ui-shell-tool-call, [data-message-kind="tool"], .ui-tool-call-line, [data-tool-status]').forEach(el => {
+        const st = (el.getAttribute('data-tool-status') || '').toLowerCase();
+        const head = (el.innerText || '').slice(0, 500);
+        if (st && !/pend|wait|run|ask/.test(st) && !/pending approval/i.test(head) && !globalBtns.length) return;
+        cards.add(el.closest('.ui-shell-tool-call') || el.closest('[data-message-kind="tool"]') || el);
+    });
+    globalBtns.forEach(b => {
+        cards.add(b.closest('.ui-shell-tool-call') || b.closest('[data-message-kind="tool"]') || b.closest('.ui-tool-call-line') || b.parentElement);
+    });
+    const out = [];
+    const seen = new Set();
+    cards.forEach(card => {
+        if (!card) return;
+        let btns = Array.from(card.querySelectorAll('button, [role="button"]')).filter(b => !isMenu(b) && isApproval(b));
+        const head = (card.innerText || '').slice(0, 800);
+        const st = ((card.closest('[data-tool-status]') || card).getAttribute('data-tool-status') || '').toLowerCase();
+        const pending = /pending approval/i.test(head) || /pend|wait|ask/.test(st);
+        if (!btns.length && pending && globalBtns.length) btns = globalBtns;
+        if (!btns.length) return;
+        const raw = ((card.closest('[data-tool-call-id]') || card).getAttribute('data-tool-call-id') || '');
+        const id = raw.split(/[\s\n]+/)[0].trim();
+        if (id && seen.has(id)) return;
+        if (id) seen.add(id);
+        const d = card.querySelector('.ui-shell-tool-call__description');
+        const cmd = card.querySelector('.ui-shell-tool-call__command, .ui-shell-tool-call__summary');
+        const parts = [];
+        if (d && d.textContent.trim()) parts.push(d.textContent.trim());
+        if (cmd && cmd.textContent.trim()) parts.push(cmd.textContent.trim());
+        if (!parts.length) {
+            const line = head.split('\n').map(s => s.trim()).filter(Boolean).slice(0, 4).join(' ');
+            if (line) parts.push(line.slice(0, 240));
+        }
+        out.push({
+            id: id || ('approval-' + out.length),
+            text: parts.join(' ') || 'Pending approval',
+            selector: id ? ('[data-tool-call-id^="' + id + '"] .ui-shell-tool-call') : '.ui-shell-tool-call',
+            buttons_selector: id ? ('[data-tool-call-id^="' + id + '"] button, [data-tool-call-id^="' + id + '"] [role="button"]') : '.ui-shell-tool-call button',
+            buttons: btns.map((b, i) => ({ label: labelOf(b), index: i }))
+        });
+    });
+    return JSON.stringify(out);
+})();
+"""
+
+
+def _emit_confirmation(cid, text, buttons, btns_selector, sec_selector, tool_id):
+    """Send one pending Run/Skip card to Telegram. Returns True if newly emitted."""
+    tool_id = (tool_id or '').split()[0].strip()
+    confirm_key = _tg_confirm_key(tool_id)
+    with pending_confirms_lock:
+        if confirm_key in pending_confirms or tool_id in pending_confirms:
+            return False
+        pending_confirms[confirm_key] = {
+            'buttons_selector': btns_selector,
+            'buttons': buttons,
+            'orig_id': tool_id,
+        }
+
+    rule_result = command_rules.match(text) if COMMAND_RULES else None
+    if rule_result == 'accept' and btns_selector:
+        accept_idx, accept_label = command_rules.find_accept_button(buttons)
+        if accept_idx is not None:
+            png = cdp_screenshot_element(sec_selector) if sec_selector else None
+            click_result = _click_confirm_button(
+                btns_selector, accept_idx, accept_label or 'Run', tool_id
+            )
+            if click_result and str(click_result).startswith('OK'):
+                print(f"[command-rules] Auto-accepted: {text} -> {accept_label}")
+                if cid and not muted:
+                    if png:
+                        tg_send_photo_bytes(cid, png, filename='auto_accept.png',
+                                            caption=f"✅ Auto: {text}")
+                    else:
+                        tg_send(cid, f"✅ Auto: {text}")
+                with pending_confirms_lock:
+                    pending_confirms.pop(confirm_key, None)
+                return True
+
+    if muted or not cid:
+        return True
+    tg_typing(cid)
+    png = cdp_screenshot_element(sec_selector) if sec_selector else None
+    keyboard = []
+    for btn in buttons or []:
+        label = (btn.get('label') or f"Button {btn.get('index', 0)}")[:64]
+        keyboard.append([{
+            'text': label or 'Run',
+            'callback_data': f"btn_{btn['index']}:{confirm_key}"
+        }])
+    sent_ok = False
+    caption = f"⚡ {text}"
+    if png and keyboard:
+        print(f"[monitor] Forwarding CONFIRMATION with keyboard: {text}")
+        photo_result = tg_send_photo_bytes_with_keyboard(
+            cid, png, keyboard, filename='confirmation.png', caption=caption)
+        sent_ok = bool(photo_result and photo_result.get('ok'))
+        if sent_ok:
+            _remember_confirm_tg(confirm_key, photo_result, cid, caption, True)
+    if not sent_ok and keyboard:
+        print(f"[monitor] Forwarding CONFIRMATION as text: {text}")
+        result = tg_call('sendMessage', chat_id=cid, text=caption,
+                         reply_markup={'inline_keyboard': keyboard})
+        sent_ok = bool(result.get('ok'))
+        if sent_ok:
+            _remember_confirm_tg(confirm_key, result, cid, caption, False)
+    if not sent_ok:
+        print("[monitor] Confirmation keyboard rejected, sending text only")
+        tg_send(cid, f"⚡ {text}\n\nBấm Run/Skip trên Cursor (Telegram không nhận được nút).")
+    return True
+
+
+def _scan_pending_approvals(cid):
+    """Find Skip/Run cards in every Cursor window, including ones skipped at monitor init."""
+    live_ids = set()
+    live_keys = set()
+    scanned = 0
+    for iid, info in list(instance_registry.items()):
+        conn = info.get('ws')
+        if conn is None:
+            continue
+        try:
+            raw = cdp_eval_on(conn, FIND_PENDING_APPROVALS_JS)
+            items = json.loads(raw) if raw else []
+            scanned += 1
+        except Exception:
+            continue
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            tid = (item.get('id') or '').split()[0].strip()
+            if tid:
+                live_ids.add(tid)
+                live_keys.add(_tg_confirm_key(tid))
+            if _emit_confirmation(
+                cid,
+                item.get('text') or 'Pending approval',
+                item.get('buttons') or [],
+                item.get('buttons_selector') or '',
+                item.get('selector') or '',
+                item.get('id') or '',
+            ):
+                ws_name = (info.get('workspace') or iid[:8])
+                print(f"[monitor] Pending approval scanned in {ws_name}: {item.get('text', '')[:60]}")
+    if scanned:
+        _dismiss_stale_confirms(live_ids, live_keys)
 
 
 def _save_active_chat(workspace, chat_name, pc_id):
@@ -130,6 +373,73 @@ def tg_typing(cid):
     return tg_call('sendChatAction', chat_id=cid, action='typing')
 
 
+def tg_dismiss_confirm(chat_id, message_id, status, old_text=None, is_photo=None):
+    """Remove Run/Skip buttons and mark the confirmation as already handled."""
+    if not chat_id or not message_id:
+        return
+    empty = {'inline_keyboard': []}
+    old = (old_text or '').strip()
+    if old.startswith('✅') or old.startswith('⏭'):
+        caption = old[:1024]
+    elif old:
+        caption = f"{status}\n{old}"[:1024]
+    else:
+        caption = status
+    if is_photo is not False:
+        result = tg_call('editMessageCaption', chat_id=chat_id, message_id=message_id,
+                         caption=caption, reply_markup=empty)
+        if result.get('ok'):
+            return result
+    result = tg_call('editMessageText', chat_id=chat_id, message_id=message_id,
+                     text=caption[:4000], reply_markup=empty)
+    if result.get('ok'):
+        return result
+    return tg_call('editMessageReplyMarkup', chat_id=chat_id, message_id=message_id,
+                   reply_markup=empty)
+
+
+def _remember_confirm_tg(confirm_key, tg_result, cid, caption, is_photo):
+    """Store Telegram message id so we can hide Run/Skip after Cursor already ran."""
+    if not tg_result or not tg_result.get('ok'):
+        return
+    mid = (tg_result.get('result') or {}).get('message_id')
+    if not mid:
+        return
+    with pending_confirms_lock:
+        rec = pending_confirms.get(confirm_key)
+        if rec is None:
+            return
+        rec['tg_chat_id'] = cid
+        rec['tg_message_id'] = mid
+        rec['tg_photo'] = bool(is_photo)
+        rec['tg_caption'] = caption
+        rec['gone_ticks'] = 0
+        rec['dismissed'] = False
+
+
+def _dismiss_stale_confirms(live_ids, live_keys):
+    """If Cursor no longer shows Run/Skip for a tracked card, hide the Telegram buttons."""
+    stale = []
+    with pending_confirms_lock:
+        for key, rec in list(pending_confirms.items()):
+            if rec.get('dismissed') or not rec.get('tg_message_id'):
+                continue
+            orig = rec.get('orig_id') or ''
+            if key in live_keys or orig in live_ids:
+                rec['gone_ticks'] = 0
+                continue
+            rec['gone_ticks'] = rec.get('gone_ticks', 0) + 1
+            if rec['gone_ticks'] >= 2:
+                stale.append((key, dict(rec)))
+    for key, rec in stale:
+        print(f"[monitor] Cursor already ran, hiding Telegram Run ({str(rec.get('orig_id', ''))[:24]})")
+        tg_dismiss_confirm(
+            rec.get('tg_chat_id'), rec.get('tg_message_id'),
+            '✅ Đã chạy trên Cursor', rec.get('tg_caption'), rec.get('tg_photo'))
+        with pending_confirms_lock:
+            pending_confirms.pop(key, None)
+
+
 def tg_send(cid, text):
     if not cid:
         return
@@ -156,12 +466,44 @@ def tg_escape_markdown_v2(text):
     return ''.join('\\' + ch if ch in special else ch for ch in text)
 
 
+_STATUS_THOUGHT_RE = re.compile(r'^(thought|thinking)\b', re.I)
+_STATUS_WAITING_RE = re.compile(r'^(waited|waiting)\b', re.I)
+
+
+def _collapse_status_text(text):
+    """Drop duplicated collapsed-header tokens: 'Thought\\nbriefly\\nbriefly' → 'Thought briefly'."""
+    lines = [ln.strip() for ln in (text or '').splitlines() if ln.strip()]
+    out = []
+    for ln in lines:
+        if not out or ln.lower() != out[-1].lower():
+            out.append(ln)
+    if not out:
+        return (text or '').strip()
+    if len(out) <= 4:
+        return ' '.join(out)
+    return (text or '').strip()
+
+
+def _status_event_key(text):
+    """Key for consecutive thought/waiting dedup. Same family → same key."""
+    collapsed = _collapse_status_text(text)
+    t = re.sub(r'\s+', ' ', collapsed).strip()
+    if not t:
+        return None
+    if _STATUS_THOUGHT_RE.match(t):
+        return 'status:thought'
+    if _STATUS_WAITING_RE.match(t):
+        return 'status:waiting'
+    return t.lower()
+
+
 def tg_send_thinking(cid, text):
     """Send thinking text to Telegram in italic with 💭 prefix.
     Tries MarkdownV2 italic first, falls back to plain text if formatting fails.
     """
     if not cid or not text:
         return
+    text = _collapse_status_text(text)
     # Truncate if very long (thinking can be verbose)
     if len(text) > 3500:
         cut = text[:3500].rfind('\n')
@@ -378,6 +720,10 @@ def parse_instance_title(title):
     parts = title.split(' - ')
     if len(parts) >= 3 and parts[-1].strip() == 'Cursor':
         return parts[-2]
+    if len(parts) == 2 and parts[-1].strip() == 'Cursor':
+        name = parts[0].strip()
+        if name and name.lower() != 'cursor':
+            return name
     return None
 
 
@@ -556,10 +902,26 @@ def _build_context_annotation(ctx, pc_id):
     return None
 
 
+CDP_NEEDED_MSG = (
+    "Bot đang chạy, nhưng Cursor chưa bật chế độ debug (CDP) nên chưa nhắn được vào IDE.\n\n"
+    "Làm lần lượt:\n"
+    "1. Lưu file, rồi File → Exit (tắt hết cửa sổ Cursor)\n"
+    "2. Mở lại Cursor từ Start Menu\n"
+    "3. Nhắn lại tin này"
+)
+
+
+def cdp_ready():
+    return bool(instance_registry)
+
+
 def cdp_connect():
     """Connect to all Cursor instances. Restores the last active chat from .active_chat, or defaults to the first instance with a workspace."""
     global ws, instance_registry, active_instance_id, mirrored_chat, _browser_ws_url
-    port = detect_cdp_port()
+    port = detect_cdp_port(exit_on_fail=False)
+    if not port:
+        print("[cdp] No Cursor process with CDP detected.")
+        return False
     print(f"[cdp] Using port {port}")
     try:
         binfo = requests.get(f'http://localhost:{port}/json/version', timeout=3).json()
@@ -571,7 +933,7 @@ def cdp_connect():
 
     if not instances:
         print("ERROR: No Cursor instances found on CDP port.")
-        sys.exit(1)
+        return False
 
     instance_registry.clear()
     for w in instances:
@@ -593,7 +955,7 @@ def cdp_connect():
 
     if not instance_registry:
         print("ERROR: Could not connect to any Cursor instance.")
-        sys.exit(1)
+        return False
 
     for iid, info in instance_registry.items():
         if info['workspace']:
@@ -636,6 +998,7 @@ def cdp_connect():
         active_name = instance_registry[active_instance_id]['workspace'] or '(no workspace)'
         print(f"[cdp] Active (default): {active_name}")
     ws = instance_registry[active_instance_id]['ws']
+    return True
 
 
 msg_id_counter = 0
@@ -1404,8 +1767,9 @@ def cursor_switch_conv(index):
 def cursor_get_turn_info(composer_prefix='', conn=None):
     """Get the last turn's user message and all AI response sections.
     
-    Uses composer-human-ai-pair-container which groups one user message
-    with all its AI responses as a single turn.
+    Groups one user message with the AI responses that follow it.
+    Cursor 3.19+ virtualizes the transcript (no .composer-human-ai-pair-container);
+    older builds still use the pair-container DOM.
     Returns individual sections (not joined) for real-time streaming.
     'turn_id' = unique DOM id of the human message (detects new turns).
     'user_full' = complete user message for forwarding to Telegram.
@@ -1448,14 +1812,28 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                 scope = scoped;
             }
             const containers = scope.querySelectorAll('.composer-human-ai-pair-container');
-            if (containers.length === 0) return JSON.stringify({ turn_id: '', user_full: '', sections: [], images: [] });
+            const last = containers.length ? containers[containers.length - 1] : null;
 
-            const last = containers[containers.length - 1];
+            // Cursor 3.19+: messages live in a virtualized list, not pair containers.
+            let humanMsg = last ? last.querySelector('[data-message-role="human"]') : null;
+            let allBubbles = last ? last.querySelectorAll('[data-message-role="ai"], [data-message-kind="tool"]') : [];
+            if (!last) {
+                const msgs = Array.from(scope.querySelectorAll('[data-message-role="human"], [data-message-role="ai"]'));
+                let lastHumanIdx = -1;
+                for (let i = msgs.length - 1; i >= 0; i--) {
+                    if (msgs[i].getAttribute('data-message-role') === 'human') {
+                        lastHumanIdx = i;
+                        break;
+                    }
+                }
+                if (lastHumanIdx < 0) return JSON.stringify({ turn_id: '', user_full: '', sections: [], images: [], conv: '' });
+                humanMsg = msgs[lastHumanIdx];
+                allBubbles = msgs.slice(lastHumanIdx + 1);
+            }
 
             // Get the user message text from this turn
             // Use the readonly lexical editor inside the human message to avoid
             // grabbing UI elements like todo widget text
-            const humanMsg = last.querySelector('[data-message-role="human"]');
             const turnId = humanMsg ? ('turn:' + (humanMsg.getAttribute('data-message-id') || '')) : '';
             let userFull = '';
             if (humanMsg) {
@@ -1465,7 +1843,7 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
 
             // Get image attachments from user message
             const images = [];
-            const imgPills = last.querySelectorAll('.context-pill-image img');
+            const imgPills = (last || humanMsg).querySelectorAll('.context-pill-image img');
             imgPills.forEach(img => {
                 if (img.src) images.push(img.src);
             });
@@ -1474,7 +1852,6 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
             // Walks all message bubbles (AI text, tables, code blocks, tool/file-edit blocks)
             // using data-flat-index for correct ordering.
             const sections = [];
-            const allBubbles = last.querySelectorAll('[data-message-role="ai"], [data-message-kind="tool"]');
             allBubbles.forEach(msg => {
                 const msgId = msg.getAttribute('data-message-id') || '';
                 const bubbleSuffix = msgId.split('-').pop();
@@ -1487,15 +1864,37 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                 // --- Tool messages (file edits, confirmations, etc.) ---
                 if (kind === 'tool') {
                     const toolStatus = msg.getAttribute('data-tool-status');
-                    const toolCallId = msg.getAttribute('data-tool-call-id') || '';
-                    // Pending confirmation: find action buttons (may be in status row
-                    // for file edits, or in menu controls for WebFetch/other tools)
-                    const actionBtns = msg.querySelectorAll('[data-click-ready="true"]');
+                    const toolCallId = (msg.getAttribute('data-tool-call-id') || '').split(/\\s+/)[0].trim();
+                    // Pending confirmation: Cursor 3.19 uses per-card Run/Skip/Allowlist
+                    // buttons; older builds used [data-click-ready="true"] inside the tool msg.
+                    const isApprovalLabel = (btn) => {
+                        const t = ((btn.innerText || '') + ' ' + (btn.getAttribute('aria-label') || ''))
+                            .replace(/\\s*(Shift\\+)?⏎\\s*/g, ' ').replace(/\\s+/g, ' ').trim();
+                        return /^(Run|Skip|Allowlist|Allow list|Allow|Reject|Accept)\\b/i.test(t);
+                    };
+                    const isMenu = (b) => {
+                        const p = b.getAttribute('aria-haspopup');
+                        return p === 'menu' || p === 'true' || p === 'listbox';
+                    };
+                    const legacyBtns = Array.from(msg.querySelectorAll('[data-click-ready="true"]')).filter(b => !isMenu(b) && isApprovalLabel(b));
+                    const approvalRoot = msg.querySelector('.ui-shell-tool-call__approval-row') || msg.querySelector('.ui-shell-tool-call') || msg;
+                    const modernParts = [
+                        'button.ui-shell-tool-call__run-btn:not([aria-haspopup])',
+                        'button.ui-shell-tool-call__skip-btn:not([aria-haspopup])',
+                        'button.ui-shell-tool-call__allowlist-button:not([aria-haspopup])'
+                    ];
+                    const modernSel = modernParts.join(', ');
+                    let modernBtns = Array.from(approvalRoot.querySelectorAll(modernSel)).filter(b => !isMenu(b));
+                    if (!modernBtns.length) {
+                        modernBtns = Array.from(approvalRoot.querySelectorAll('button.ui-button, button')).filter(b => !isMenu(b) && isApprovalLabel(b));
+                    }
+                    const actionBtns = legacyBtns.length ? legacyBtns : modernBtns;
+                    const usedModern = !legacyBtns.length && modernBtns.length > 0;
 
                     if (actionBtns.length > 0) {
                         // Collect all buttons universally (labels + indices)
-                        const buttons = Array.from(actionBtns).map((btn, idx) => ({
-                            label: btn.innerText.trim().replace(/\\s+/g, ' '),
+                        const buttons = actionBtns.map((btn, idx) => ({
+                            label: (btn.innerText || btn.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').replace(/\\s*(Shift\\+)?⏎\\s*/g, '').trim() || ('Button ' + idx),
                             index: idx
                         }));
 
@@ -1535,14 +1934,33 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                                 }
                             }
                             cleanText = parts.join(' ') || 'Action pending';
+                        } else {
+                            const d = msg.querySelector('.ui-shell-tool-call__description');
+                            const cmd = msg.querySelector('.ui-shell-tool-call__command, .ui-shell-tool-call__summary');
+                            const parts = [];
+                            if (d) parts.push(d.textContent.trim());
+                            if (cmd) parts.push(cmd.textContent.trim());
+                            cleanText = parts.filter(Boolean).join(' ') || 'Pending approval';
                         }
                         const bubbleSelector = '#bubble-' + bubbleSuffix;
+                        const buttonsSelector = usedModern
+                            ? (toolCallId
+                                ? modernParts.map(p => '[data-tool-call-id^="' + toolCallId + '"] ' + p).join(', ')
+                                  + ', [data-tool-call-id^="' + toolCallId + '"] button.ui-button'
+                                : modernParts.map(p => '.ui-shell-tool-call__approval-row ' + p).join(', ')
+                                  + ', .ui-shell-tool-call button.ui-button')
+                            : (bubbleSelector + ' [data-click-ready="true"]');
+                        const shotSelector = usedModern
+                            ? (toolCallId
+                                ? '[data-tool-call-id^="' + toolCallId + '"] .ui-shell-tool-call'
+                                : '.ui-shell-tool-call')
+                            : (bubbleSelector + ' .composer-tool-former-message > div');
                         sections.push({
                             text: cleanText,
                             type: 'confirmation',
                             id: toolCallId || ('gen:' + msgId + ':' + subIdx),
-                            selector: bubbleSelector + ' .composer-tool-former-message > div',
-                            buttons_selector: bubbleSelector + ' [data-click-ready="true"]',
+                            selector: shotSelector,
+                            buttons_selector: buttonsSelector,
                             buttons: buttons
                         });
                         return;
@@ -1578,7 +1996,9 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                     // Cursor removes thinking content from DOM when collapsed.
                     // If collapsed, click the header to expand so we can read
                     // the content on the next tick.
-                    let root = msg.querySelector('.anysphere-markdown-container-root');
+                    let root = msg.querySelector('.anysphere-markdown-container-root')
+                            || msg.querySelector('.markdown-root')
+                            || msg.querySelector('.ui-markdown');
                     if (!root) {
                         const header = msg.querySelector('.collapsible-thought > div:first-child');
                         if (header) header.click();
@@ -1588,13 +2008,19 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                     let thinkText = '';
                     if (root) {
                         const parts = [];
-                        for (const child of root.children) {
-                            if (child.classList.contains('markdown-section')) {
+                        const oldSections = root.querySelectorAll('.markdown-section');
+                        if (oldSections.length) {
+                            oldSections.forEach(child => {
                                 const t = getSectionText(child);
                                 if (t) parts.push(t);
-                            }
+                            });
+                        } else {
+                            const t = (root.innerText || '').trim();
+                            if (t) parts.push(t);
                         }
                         thinkText = parts.join('\\n');
+                    } else {
+                        thinkText = (msg.innerText || '').trim();
                     }
                     // Always push (even if empty) to hold correct index position.
                     sections.push({
@@ -1607,8 +2033,34 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                 }
 
                 // --- AI text messages (markdown sections, code blocks + tables) ---
-                const root = msg.querySelector('.anysphere-markdown-container-root');
-                if (!root) return;
+                const root = msg.querySelector('.anysphere-markdown-container-root')
+                          || msg.querySelector('.markdown-root')
+                          || msg.querySelector('.ui-markdown')
+                          || msg.querySelector('.agent-transcript-row-markdown');
+                if (!root) {
+                    const fallback = (msg.innerText || '').trim();
+                    if (fallback) {
+                        sections.push({
+                            text: fallback,
+                            type: 'text',
+                            id: msgId || ('gen:' + subIdx),
+                            selector: null
+                        });
+                    }
+                    return;
+                }
+                if (!root.querySelector('.markdown-section') && !root.querySelector('.markdown-table-container')) {
+                    const text = (root.innerText || '').trim();
+                    if (text.length > 0) {
+                        sections.push({
+                            text: text,
+                            type: 'text',
+                            id: msgId || ('gen:' + subIdx),
+                            selector: null
+                        });
+                    }
+                    return;
+                }
                 let tableIndex = 0;
 
                 let codeBlockIndex = 0;
@@ -1683,6 +2135,48 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                     }
                 }
             });
+
+            // Cursor 3.19: Run/Skip/Allowlist live in .ui-shell-tool-call__approval-row
+            // and may not be classified via the legacy click-ready path above.
+            if (!sections.some(s => s.type === 'confirmation')) {
+                const modernPartsOuter = [
+                    'button.ui-shell-tool-call__run-btn:not([aria-haspopup])',
+                    'button.ui-shell-tool-call__skip-btn:not([aria-haspopup])',
+                    'button.ui-shell-tool-call__allowlist-button:not([aria-haspopup])'
+                ];
+                const modernSelOuter = modernPartsOuter.join(', ');
+                scope.querySelectorAll('.ui-shell-tool-call__approval-row').forEach(row => {
+                    const card = row.closest('.ui-shell-tool-call') || row.closest('[data-message-kind="tool"]') || row;
+                    const actionBtns = Array.from(row.querySelectorAll(modernSelOuter)).filter(b => {
+                        const p = b.getAttribute('aria-haspopup');
+                        return p !== 'menu' && p !== 'true' && p !== 'listbox';
+                    });
+                    if (!actionBtns.length) return;
+                    const bubble = card.closest('[data-tool-call-id]');
+                    const tid = bubble ? (bubble.getAttribute('data-tool-call-id') || '').split(/\\s+/)[0].trim() : '';
+                    if (tid && sections.some(s => s.id === tid)) return;
+                    const d = card.querySelector('.ui-shell-tool-call__description');
+                    const cmd = card.querySelector('.ui-shell-tool-call__command, .ui-shell-tool-call__summary');
+                    const parts = [];
+                    if (d && d.textContent.trim()) parts.push(d.textContent.trim());
+                    if (cmd && cmd.textContent.trim()) parts.push(cmd.textContent.trim());
+                    sections.push({
+                        text: parts.join(' ') || 'Pending approval',
+                        type: 'confirmation',
+                        id: tid || ('gen:approval:' + sections.length),
+                        selector: tid ? '[data-tool-call-id^="' + tid + '"] .ui-shell-tool-call' : '.ui-shell-tool-call',
+                        buttons_selector: tid
+                            ? modernPartsOuter.map(p => '[data-tool-call-id^="' + tid + '"] ' + p).join(', ')
+                              + ', [data-tool-call-id^="' + tid + '"] button.ui-button'
+                            : modernPartsOuter.map(p => '.ui-shell-tool-call__approval-row ' + p).join(', ')
+                              + ', .ui-shell-tool-call button.ui-button',
+                        buttons: actionBtns.map((btn, idx) => ({
+                            label: ((btn.innerText || btn.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ')) || ('Button ' + idx),
+                            index: idx
+                        }))
+                    });
+                });
+            }
 
             // Active conversation name from the checked tab (scoped to agent-tabs to avoid terminal tabs)
             const convTab = document.querySelector('[class*="agent-tabs"] li[class*="checked"] a[aria-id="chat-horizontal-tab"]');
@@ -1847,26 +2341,39 @@ def sender_thread():
                             else:
                                 tg_call('answerCallbackQuery', callback_query_id=cb_id, text=f'Switched')
                             print(f"[sender] Agent switch: {result}")
-                    elif selectors and action.startswith('btn_'):
+                    elif action.startswith('btn_'):
                         # Universal button click: action = "btn_INDEX"
+                        cb_msg = callback.get('message') or {}
                         try:
                             btn_index = int(action.split('_', 1)[1])
                         except (ValueError, IndexError):
                             tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Invalid button')
                             continue
-                        btns_selector = selectors.get('buttons_selector', '')
-                        btn_label = next((b['label'] for b in selectors.get('buttons', []) if b['index'] == btn_index), f'Button {btn_index}')
-                        print(f"[sender] Callback: click button [{btn_index}] '{btn_label}' for tool {tool_id[:12]}...")
-                        click_result = cdp_eval(f"""
-                            (function() {{
-                                const btns = document.querySelectorAll('{btns_selector}');
-                                if (!btns[{btn_index}]) return 'ERROR: button ' + {btn_index} + ' not found (' + btns.length + ' buttons)';
-                                btns[{btn_index}].click();
-                                return 'OK';
-                            }})();
-                        """)
-                        print(f"[sender] Click result: {click_result}")
-                        tg_call('answerCallbackQuery', callback_query_id=cb_id, text=btn_label)
+                        btn_label = 'Run'
+                        click_result = None
+                        if selectors:
+                            btns_selector = selectors.get('buttons_selector', '')
+                            btn_label = next((b['label'] for b in selectors.get('buttons', []) if b['index'] == btn_index), f'Button {btn_index}')
+                            orig_id = selectors.get('orig_id') or tool_id
+                            print(f"[sender] Callback: click button [{btn_index}] '{btn_label}' for tool {str(orig_id)[:12]}...")
+                            click_result = _click_confirm_button(btns_selector, btn_index, btn_label, orig_id)
+                            print(f"[sender] Click result: {click_result}")
+                        ok = bool(click_result and str(click_result).startswith('OK'))
+                        label_l = (btn_label or '').lower()
+                        if ok:
+                            status = '⏭ Đã Skip' if label_l.startswith('skip') else f'✅ {btn_label}'
+                            toast = btn_label
+                        else:
+                            status = '✅ Đã chạy trên Cursor'
+                            toast = 'Đã chạy trên Cursor'
+                        tg_dismiss_confirm(
+                            cb_msg.get('chat', {}).get('id'),
+                            cb_msg.get('message_id'),
+                            status,
+                            cb_msg.get('caption') or cb_msg.get('text'),
+                            bool(cb_msg.get('photo')),
+                        )
+                        tg_call('answerCallbackQuery', callback_query_id=cb_id, text=toast)
                     else:
                         tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Expired')
                     continue
@@ -1901,6 +2408,8 @@ def sender_thread():
                     chat_id_file.write_text(str(cid))
                     print(f"[owner] Auto-paired with {user} (ID: {user_id})")
                     tg_send(cid, "🔗 You're in! Messages flow both ways now.\nUse /pause to mute, /play to resume.")
+                    if not cdp_ready():
+                        tg_send(cid, CDP_NEEDED_MSG)
                     if tg_commands_need_update():
                         tg_ask_command_update(cid)
                     continue
@@ -1914,6 +2423,10 @@ def sender_thread():
                 with chat_id_lock:
                     chat_id = cid
                 chat_id_file.write_text(str(cid))
+
+                if (photo or voice) and not cdp_ready():
+                    tg_send(cid, CDP_NEEDED_MSG)
+                    continue
 
                 # Handle photo messages (from phone gallery, camera, etc.)
                 if photo:
@@ -1985,6 +2498,10 @@ def sender_thread():
                     continue
 
                 print(f"[sender] {user}: {text}")
+
+                if text not in ('/start', '/unpair', '/pause', '/play') and not cdp_ready():
+                    tg_send(cid, CDP_NEEDED_MSG)
+                    continue
 
                 # Handle commands
                 if text == '/start':
@@ -2111,6 +2628,15 @@ def _composer_prefix_from_pcid(pc_id):
     return ''
 
 
+def _monitor_progress_key(iid, pc_id):
+    """Stable key so switch-back can resume the same chat (pc_id survives window moves)."""
+    if pc_id:
+        return f"pc:{pc_id}"
+    if iid:
+        return f"iid:{iid}"
+    return None
+
+
 def monitor_thread():
     global mirrored_chat
     print("[monitor] Starting Cursor monitor...")
@@ -2126,6 +2652,25 @@ def monitor_thread():
     STABLE_THRESHOLD = 2        # Forward section after 2s of no change
     initialized = False
     marked_done = False         # Whether we've sent ✅ for this turn
+    last_status_key = None      # Consecutive thought/waiting Telegram dedup
+    chat_progress = {}          # {progress_key: snapshot} — catch up after unfocus
+
+    def _snap_progress():
+        return {
+            'last_turn_id': last_turn_id,
+            'last_conv': last_conv,
+            'forwarded_ids': set(forwarded_ids),
+            'sent_this_turn': sent_this_turn,
+            'prev_by_id': dict(prev_by_id),
+            'section_stable': dict(section_stable),
+            'marked_done': marked_done,
+            'last_status_key': last_status_key,
+        }
+
+    def _store_progress(iid, pc_id):
+        key = _monitor_progress_key(iid, pc_id)
+        if key:
+            chat_progress[key] = _snap_progress()
 
     while True:
         try:
@@ -2135,6 +2680,8 @@ def monitor_thread():
                 cid = chat_id
             if not cid:
                 continue
+
+            _scan_pending_approvals(cid)
 
             # Get the last turn's info (scoped to mirrored chat's composer-id)
             # Use mirrored_chat's instance connection — not active_conn()
@@ -2156,24 +2703,18 @@ def monitor_thread():
                         pass
 
                 if not found_iid:
+                    monitor_thread._empty_turn_ticks = getattr(monitor_thread, '_empty_turn_ticks', 0) + 1
+                    if monitor_thread._empty_turn_ticks % 15 == 1:
+                        print(f"[monitor] No turn DOM yet for composer {cp}")
                     continue
 
                 ws_label = (instance_registry[found_iid].get('workspace') or found_iid[:8]).removesuffix(' (Workspace)')
-                print(f"[monitor] Composer {cp} moved to {ws_label}, skipping {len(turn['sections'])} existing")
+                print(f"[monitor] Composer {cp} moved to {ws_label} — keep tracking")
                 mirrored_chat = (found_iid, mc[1], mc[2])
                 last_iid = found_iid
                 last_mc_pcid = mc[1]
-                last_turn_id = turn['turn_id']
-                last_conv = turn.get('conv', '')
-                forwarded_ids = {
-                    sec.get('id', '') for sec in turn['sections']
-                    if isinstance(sec, dict) and sec.get('id')
-                }
-                prev_by_id = {sec.get('id', ''): sec.get('text', '')
-                              for sec in turn['sections'] if isinstance(sec, dict) and sec.get('id')}
-                section_stable = {}
-                sent_this_turn = False
-                marked_done = False
+                last_turn_id = turn['turn_id'] or last_turn_id
+                last_conv = turn.get('conv', '') or last_conv
                 continue
 
             turn_id = turn['turn_id']              # Unique DOM id per turn
@@ -2195,30 +2736,26 @@ def monitor_thread():
                 switched = True
 
             if switched:
+                _store_progress(last_iid, last_mc_pcid)
                 if cur_iid != last_iid:
                     cp = _composer_prefix_from_pcid(cur_pcid) if cur_pcid else ''
-                    turn = cursor_get_turn_info(cp)
+                    new_conn = instance_registry.get(cur_iid, {}).get('ws')
+                    turn = cursor_get_turn_info(cp, conn=new_conn)
                     if not turn['turn_id'] and not turn['sections']:
                         for _retry in range(8):
                             time.sleep(0.5)
-                            turn = cursor_get_turn_info(cp)
+                            turn = cursor_get_turn_info(cp, conn=new_conn)
                             if turn['turn_id'] or turn['sections']:
                                 break
                     turn_id = turn['turn_id']
                     sections = turn['sections']
                     conv = turn.get('conv', '')
+                    user_full = turn.get('user_full', user_full)
+                    images = turn.get('images', images)
+                    mc_conn = new_conn or mc_conn
                 cur_name = mc[2] if mc else conv
                 prev_name = last_conv or f'instance {last_iid[:8] if last_iid else "?"}'
-                print(f"[monitor] Switched: '{prev_name[:40]}' -> '{cur_name[:40]}', skipping {len(sections)} sections")
-                forwarded_ids = {
-                    sec.get('id', '') for sec in sections
-                    if isinstance(sec, dict) and sec.get('id')
-                }
-                sent_this_turn = False
-                prev_by_id = {sec.get('id', ''): sec.get('text', '')
-                              for sec in sections if isinstance(sec, dict) and sec.get('id')}
-                section_stable = {}
-                marked_done = False
+                saved = chat_progress.get(_monitor_progress_key(cur_iid, cur_pcid) or '')
                 if CONTEXT_MONITOR and cur_pcid:
                     ctx = get_context_pct(mc_conn)
                     if ctx is not None:
@@ -2226,11 +2763,43 @@ def monitor_thread():
                         _context_pct_names[cur_pcid] = cur_name
                         _save_context_pcts(pc_id=cur_pcid, chat_name=cur_name)
                         print(f"[context-monitor] Switch: {ctx}% in '{cur_name}'")
-                last_turn_id = turn_id
-                last_conv = conv
-                last_mc_pcid = cur_pcid
-                last_iid = cur_iid
-                continue
+                if saved:
+                    last_turn_id = saved['last_turn_id']
+                    last_conv = saved.get('last_conv') or conv
+                    forwarded_ids = set(saved['forwarded_ids'])
+                    sent_this_turn = saved['sent_this_turn']
+                    prev_by_id = dict(saved['prev_by_id'])
+                    section_stable = dict(saved['section_stable'])
+                    marked_done = saved['marked_done']
+                    last_status_key = saved.get('last_status_key')
+                    initialized = True
+                    n_new = sum(
+                        1 for s in sections
+                        if isinstance(s, dict) and s.get('id') and s['id'] not in forwarded_ids
+                    )
+                    print(f"[monitor] Switched: '{prev_name[:40]}' -> '{cur_name[:40]}', "
+                          f"catch-up {n_new} new / {len(sections)} sections")
+                    last_mc_pcid = cur_pcid
+                    last_iid = cur_iid
+                    # Fall through to forward sections that appeared while this chat was unfocused.
+                else:
+                    print(f"[monitor] Switched: '{prev_name[:40]}' -> '{cur_name[:40]}', skipping {len(sections)} sections")
+                    forwarded_ids = {
+                        sec.get('id', '') for sec in sections
+                        if isinstance(sec, dict) and sec.get('id')
+                    }
+                    sent_this_turn = False
+                    prev_by_id = {sec.get('id', ''): sec.get('text', '')
+                                  for sec in sections if isinstance(sec, dict) and sec.get('id')}
+                    section_stable = {}
+                    marked_done = False
+                    last_status_key = None
+                    last_turn_id = turn_id
+                    last_conv = conv
+                    last_mc_pcid = cur_pcid
+                    last_iid = cur_iid
+                    _store_progress(cur_iid, cur_pcid)
+                    continue
             last_conv = conv
             last_mc_pcid = cur_pcid
             last_iid = cur_iid
@@ -2257,6 +2826,7 @@ def monitor_thread():
                     prev_by_id = {sec.get('id', ''): sec.get('text', '')
                                   for sec in sections if isinstance(sec, dict) and sec.get('id')}
                     section_stable = {}
+                    _store_progress(cur_iid, cur_pcid)
                     continue
 
                 if not user_full:
@@ -2334,7 +2904,9 @@ def monitor_thread():
                 prev_by_id = {}
                 section_stable = {}
                 marked_done = False
+                last_status_key = None
                 last_turn_id = turn_id
+                _store_progress(cur_iid, cur_pcid)
                 continue
 
             if not initialized:
@@ -2390,8 +2962,16 @@ def monitor_thread():
                 else:
                     section_stable[sec_key] = 0
 
-                # Not stable yet — stop here (sequential ordering)
+                # Not stable yet — stop here, unless a later confirmation would get stuck behind
                 if section_stable.get(sec_key, 0) < STABLE_THRESHOLD:
+                    if sec_type != 'confirmation':
+                        later_confirm = any(
+                            isinstance(s, dict) and s.get('type') == 'confirmation'
+                            and (s.get('id') or '') not in forwarded_ids
+                            for s in sections[i + 1:]
+                        )
+                        if later_confirm:
+                            continue
                     break
 
                 # Don't forward empty thinking — wait for content to load
@@ -2402,9 +2982,10 @@ def monitor_thread():
 
                 if sec_type == 'confirmation':
                     # Always track confirmation selectors; send keyboard only when not muted
-                    tool_id = sec_id
+                    tool_id = (sec_id or '').split()[0].strip()
+                    confirm_key = _tg_confirm_key(tool_id)
                     with pending_confirms_lock:
-                        if tool_id in pending_confirms:
+                        if confirm_key in pending_confirms or tool_id in pending_confirms:
                             # Already tracked this confirmation
                             if sec_key:
                                 forwarded_ids.add(sec_key)
@@ -2413,9 +2994,10 @@ def monitor_thread():
                     buttons = sec.get('buttons', [])
                     btns_selector = sec.get('buttons_selector', '')
                     with pending_confirms_lock:
-                        pending_confirms[tool_id] = {
+                        pending_confirms[confirm_key] = {
                             'buttons_selector': btns_selector,
-                            'buttons': buttons
+                            'buttons': buttons,
+                            'orig_id': tool_id,
                         }
 
                     # Auto-accept: check command text against allow/deny rules
@@ -2425,14 +3007,9 @@ def monitor_thread():
                         if accept_idx is not None:
                             # Screenshot BEFORE click (click changes DOM)
                             png = cdp_screenshot_element(sec_selector) if sec_selector else None
-                            click_result = cdp_eval(f"""
-                                (function() {{
-                                    const btns = document.querySelectorAll('{btns_selector}');
-                                    if (!btns[{accept_idx}]) return 'ERROR: button not found';
-                                    btns[{accept_idx}].click();
-                                    return 'OK';
-                                }})();
-                            """)
+                            click_result = _click_confirm_button(
+                                btns_selector, accept_idx, accept_label or 'Run', tool_id or ''
+                            )
                             if click_result and click_result.strip() == 'OK':
                                 print(f"[command-rules] Auto-accepted: {text} -> {accept_label}")
                                 if not muted and cid:
@@ -2442,6 +3019,7 @@ def monitor_thread():
                                     else:
                                         tg_send(cid, f"✅ Auto: {text}")
                                 with pending_confirms_lock:
+                                    pending_confirms.pop(confirm_key, None)
                                     pending_confirms.pop(tool_id, None)
                                 if sec_key:
                                     forwarded_ids.add(sec_key)
@@ -2451,29 +3029,43 @@ def monitor_thread():
                                 print(f"[command-rules] Auto-accept click failed ({click_result}), falling back to keyboard")
 
                     if not muted:
+                        last_status_key = None
                         tg_typing(cid)
                         png = None
                         if sec_selector:
                             png = cdp_screenshot_element(sec_selector)
                         keyboard = []
                         for btn in buttons:
+                            label = (btn.get('label') or f"Button {btn.get('index', 0)}")[:64]
                             keyboard.append([{
-                                'text': btn['label'],
-                                'callback_data': f"btn_{btn['index']}:{tool_id}"
+                                'text': label or 'Run',
+                                'callback_data': f"btn_{btn['index']}:{confirm_key}"
                             }])
+                        sent_ok = False
+                        caption = f"⚡ {text}"
                         if png:
                             print(f"[monitor] Forwarding CONFIRMATION with keyboard: {text}")
-                            tg_send_photo_bytes_with_keyboard(cid, png, keyboard,
-                                filename='confirmation.png', caption=f"⚡ {text}")
-                        else:
+                            photo_result = tg_send_photo_bytes_with_keyboard(cid, png, keyboard,
+                                filename='confirmation.png', caption=caption)
+                            sent_ok = bool(photo_result and photo_result.get('ok'))
+                            if sent_ok:
+                                _remember_confirm_tg(confirm_key, photo_result, cid, caption, True)
+                        if not sent_ok:
                             print(f"[monitor] Forwarding CONFIRMATION as text: {text}")
-                            tg_call('sendMessage', chat_id=cid, text=f"⚡ {text}",
+                            result = tg_call('sendMessage', chat_id=cid, text=caption,
                                     reply_markup={'inline_keyboard': keyboard})
+                            sent_ok = bool(result.get('ok'))
+                            if sent_ok:
+                                _remember_confirm_tg(confirm_key, result, cid, caption, False)
+                        if not sent_ok:
+                            print("[monitor] Confirmation keyboard rejected, sending text only")
+                            tg_send(cid, f"⚡ {text}\n\nBấm Run/Skip trên Cursor (Telegram không nhận được nút).")
 
                 elif not muted:
                     # Only send to Telegram when not muted
                     tg_typing(cid)
                     if sec_type in ('table', 'file_edit', 'code_block', 'latex'):
+                        last_status_key = None
                         file_path = None
                         if sec_type == 'file_edit':
                             fn_sel = sec.get('filename_selector') if isinstance(sec, dict) else None
@@ -2510,12 +3102,18 @@ def monitor_thread():
                             display_text = (file_path or text) if sec_type == 'file_edit' else text
                             tg_send(cid, f"{prefix}{display_text}")
                     elif sec_type == 'thinking':
-                        print(f"[monitor] Forwarding THINKING ({len(text)} chars)")
-                        tg_send_thinking(cid, text)
+                        skey = _status_event_key(text)
+                        if skey and skey == last_status_key:
+                            print(f"[monitor] Skipping duplicate THINKING ({len(text)} chars)")
+                        else:
+                            last_status_key = skey
+                            print(f"[monitor] Forwarding THINKING ({len(text)} chars)")
+                            tg_send_thinking(cid, text)
                     else:
                         # Check for [PHONE_OUTBOX:filename] marker
                         outbox_match = OUTBOX_MARKER_RE.search(text)
                         if outbox_match:
+                            last_status_key = None
                             outbox_filename = outbox_match.group(1).strip()
                             caption = OUTBOX_MARKER_RE.sub('', text).strip()
                             # Wait up to 15s for the file to appear
@@ -2531,8 +3129,13 @@ def monitor_thread():
                                 if caption:
                                     tg_send(cid, caption)
                         else:
-                            print(f"[monitor] Forwarding section {i+1} ({len(text)} chars)")
-                            tg_send(cid, text)
+                            skey = _status_event_key(text)
+                            if skey in ('status:thought', 'status:waiting') and skey == last_status_key:
+                                print(f"[monitor] Skipping duplicate status ({len(text)} chars)")
+                            else:
+                                last_status_key = skey if skey in ('status:thought', 'status:waiting') else None
+                                print(f"[monitor] Forwarding section {i+1} ({len(text)} chars)")
+                                tg_send(cid, text)
 
                 # Always advance tracking — muted sections are "silently consumed"
                 if sec_key:
@@ -2556,6 +3159,8 @@ def monitor_thread():
                     print(f"[monitor] AI done — {len(forwarded_ids)} sections forwarded")
                     marked_done = True
 
+            _store_progress(cur_iid, cur_pcid)
+
         except Exception as e:
             print(f"[monitor] Error: {e}")
             time.sleep(2)
@@ -2573,6 +3178,16 @@ def monitor_thread():
 SCAN_INTERVAL = 3     # seconds between full rescans
 SCAN_VERBOSE = False  # True = log every chat per scan (fingerprint details)
 CONTEXT_MONITOR_THRESHOLD = 85
+
+def _ws_alive(sock):
+    """True if a websocket-client connection is still open."""
+    if sock is None:
+        return False
+    try:
+        return bool(getattr(sock, 'connected', False))
+    except Exception:
+        return False
+
 
 def overview_thread():
     """Periodically rescan CDP targets. Detect new/closed Cursor instances."""
@@ -2639,6 +3254,37 @@ def overview_thread():
                                 tg_send(chat_id, f"📂 Workspace opened: {label}")
                     except Exception as e:
                         print(f"[overview] Failed to connect to {label}: {e}")
+
+            # Same window, dead eval socket (Cursor refreshed CDP / host aborted the WS)
+            for inst in current:
+                iid = inst['id']
+                info = instance_registry.get(iid)
+                if not info or _ws_alive(info.get('ws')):
+                    continue
+                label = inst['workspace'] or '(no workspace)'
+                try:
+                    conn = websocket.create_connection(inst['ws_url'])
+                    listener_conn = _setup_chat_listener(iid, inst['ws_url'], label)
+                    with cdp_lock:
+                        old_ws = info.get('ws')
+                        old_listener = info.get('listener_ws')
+                        info['ws'] = conn
+                        info['ws_url'] = inst['ws_url']
+                        info['listener_ws'] = listener_conn
+                        info.pop('listener_dead', None)
+                        if iid == active_instance_id:
+                            ws = conn
+                    for old in (old_ws, old_listener):
+                        try:
+                            if old:
+                                old.close()
+                        except Exception:
+                            pass
+                    print(f"[overview] Reconnected CDP: {label}  [{iid[:8]}]")
+                    if chat_id and not muted:
+                        tg_send(chat_id, f"🔌 Reconnected: {label}")
+                except Exception as e:
+                    print(f"[overview] CDP reconnect failed for {label}: {e}")
 
             for iid in known_ids - current_ids:
                 with cdp_lock:
@@ -2940,8 +3586,11 @@ if not _short.get('result', {}).get('short_description'):
             short_description="Cursor IDE ↔ Telegram bridge")
 
 print("Connecting to Cursor via CDP...")
-cdp_connect()
-print("Connected.")
+if cdp_connect():
+    print("Connected.")
+else:
+    print("[cdp] Cursor is not in debug mode yet. Telegram bot will still answer.")
+    print("Close ALL Cursor windows and reopen from Start Menu, then send a Telegram message.")
 
 print(f"\nPocketCursor Bridge v2 running!")
 print(f"Send a message to @{bot['username']} on Telegram.")
@@ -2949,6 +3598,8 @@ if OWNER_ID:
     print(f"Owner: {OWNER_ID}")
 if chat_id:
     print(f"Chat ID: {chat_id} (restored from previous session)")
+    if not cdp_ready():
+        tg_send(chat_id, CDP_NEEDED_MSG)
 if muted:
     print("Status: PAUSED (restored from previous session)")
 

@@ -30,7 +30,8 @@ Scenarios handled:
     K. New window slow to appear     → soft warning, report CDP port anyway
     L. Cursor crashes after launch   → verify times out, retry loop, error
 
-On Windows, multiple Cursor windows share one process and one CDP port.
+On Windows, also looks in Program Files (not only LocalAppData).
+Windows: multiple Cursor windows share one process and one CDP port.
 New windows merge into the existing process regardless of port flags.
 Truly separate instances would require --user-data-dir (edge case).
 
@@ -69,13 +70,21 @@ def find_cursor():
     """Auto-detect Cursor executable path."""
 
     if sys.platform == 'win32':
-        # Standard Windows install location
+        # Common Windows install locations (user vs machine installer)
+        pf = os.environ.get('ProgramFiles', r'C:\Program Files')
+        pf86 = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
         candidates = [
             Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'cursor' / 'Cursor.exe',
+            Path(pf) / 'cursor' / 'Cursor.exe',
+            Path(pf86) / 'cursor' / 'Cursor.exe',
         ]
         for p in candidates:
             if p.exists():
                 return str(p)
+        import shutil
+        cursor = shutil.which('cursor') or shutil.which('Cursor')
+        if cursor:
+            return cursor
 
     elif sys.platform == 'darwin':
         # macOS
