@@ -11,7 +11,7 @@ Usage: python -X utf8 pocket_cursor.py
 
 Cursor 3.19+ / Windows compatibility (this fork):
   Daniel Ha <duonghb@dataq.vn>
-  https://github.com/duonghb53/pocket-cursor
+  https://github.com/habachduong/pocket-cursor
 """
 
 import sys, io

@@ -2,7 +2,7 @@
 
 **Your Cursor, from your phone. The conversation doesn't have to end.**
 
-> **Maintained fork** by [**Daniel Ha**](https://github.com/duonghb53) · `duonghb@dataq.vn`  
+> **Maintained fork** by [**Daniel Ha**](https://github.com/habachduong) · `duonghb@dataq.vn`  
 > Tested on **Cursor 3.19.13** (Windows). [What changed →](CHANGELOG.md)  
 > Upstream: [qmHecker/pocket-cursor](https://github.com/qmHecker/pocket-cursor) (MIT)
 
@@ -202,7 +202,7 @@ Then add `RENDER_LOCAL_DIR=/path/to/local/render` to your `.env`. When the netwo
 
 | | |
 |---|---|
-| **This fork** | [Daniel Ha](https://github.com/duonghb53) · `duonghb@dataq.vn` |
+| **This fork** | [Daniel Ha](https://github.com/habachduong) · `duonghb@dataq.vn` |
 | **Original** | [Michael Hecker / qmHecker](https://github.com/qmHecker/pocket-cursor) |
 
 Issues and PRs for Cursor 3.19 / Windows: open them on **this fork**. Upstream remains the original project.
