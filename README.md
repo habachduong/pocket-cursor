@@ -34,21 +34,22 @@ python -m venv .venv
 npm install
 ```
 
-4. **Launch Cursor with CDP** (force-kills any background Cursor, then starts with port 9222):
+4. **Start everything** (force-kills background Cursor, relaunches with CDP, waits until port 9222 answers, then starts the Telegram bridge):
+
+```bat
+start_pocket.bat
+```
+
+Wait until you see `CDP OK` and `PocketCursor Bridge v2 running!`. Keep that window open.
+
+To relaunch only Cursor+CDP or only the bridge:
 
 ```bat
 start_cursor_cdp.bat
-```
-
-Wait until you see `CDP OK`.
-
-5. **Start the bridge:**
-
-```bat
 start_bridge.bat
 ```
 
-6. Message your bot on Telegram. It auto-pairs with the first user.
+5. Message your bot on Telegram. It auto-pairs with the first user.
 
 **Manual CDP flags** (if you prefer a desktop shortcut):
 
@@ -56,7 +57,7 @@ start_bridge.bat
 --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=http://localhost:9222
 ```
 
-> Closing all Cursor windows is **not** enough. Use `start_cursor_cdp.bat` or End task `Cursor` in Task Manager, then relaunch with the flags above.
+> Closing all Cursor windows is **not** enough. Use `start_pocket.bat` / `start_cursor_cdp.bat` or End task `Cursor` in Task Manager, then relaunch with the flags above.
 
 To restart only the bridge (one confirmation when Cursor asks):
 
@@ -83,6 +84,9 @@ python restart_pocket_cursor.py
 |---------|-------------|
 | `/newchat` | Start a fresh conversation |
 | `/chats` | Show your open chats across all workspaces (tap to switch) |
+| `/mode` | Switch Cursor between Agent and Ask (buttons on Telegram) |
+| `/ask` | Switch Cursor to Ask mode |
+| `/agent` | Switch Cursor to Agent mode |
 | `/pause` | Mute forwarding |
 | `/play` | Resume forwarding |
 | `/screenshot` | Screenshot your Cursor window |
@@ -149,11 +153,10 @@ python start_cursor.py
 **Windows (recommended after Cursor updates to 3.19.x):**
 
 ```bat
-start_cursor_cdp.bat
-start_bridge.bat
+start_pocket.bat
 ```
 
-`start_cursor_cdp.bat` kills background `Cursor.exe` processes, then starts Cursor with CDP. Closing windows alone will not enable debugging.
+`start_pocket.bat` kills background `Cursor.exe`, relaunches with CDP, waits for port 9222, then starts the bridge. Closing windows alone will not enable debugging. To run the steps separately: `start_cursor_cdp.bat` then `start_bridge.bat`.
 
 Or launch manually:
 

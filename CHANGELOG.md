@@ -25,6 +25,14 @@ Upstream: [qmHecker/pocket-cursor](https://github.com/qmHecker/pocket-cursor) (M
 
 ## Fork improvements — Daniel Ha
 
+### 2026-09-11 (this machine)
+
+- `start_pocket.bat`: one launcher — kill Cursor, wait for CDP port 9222, then start the Telegram bridge. Finds Node.js from a winget user install.
+- `start_bridge.bat`: look up winget Node on PATH; venv hint uses `python -m venv`.
+- Run/Skip on Telegram is **text + buttons only** (no markdown/card screenshot on each approval).
+- `/mode`, `/ask`, `/agent`: switch Cursor Agent vs Ask from Telegram.
+- Do not forward thinking / `Thought briefly` / Waiting to Telegram, so the main reply is not blocked behind status bubbles.
+
 ### Cursor 3.19 agent UI
 
 - Read the new transcript (`data-message-role`, `data-message-kind`, `.markdown-root`) instead of removed Composer classes.
@@ -47,7 +55,7 @@ Upstream: [qmHecker/pocket-cursor](https://github.com/qmHecker/pocket-cursor) (M
 
 ### Thinking / waiting spam
 
-- Consecutive `Thought briefly` / `Thought 2s` / `Thinking` / `Waiting` collapse to **one** Telegram message.
+- Consecutive `Thought briefly` / `Thought 2s` / `Thinking` / `Waiting` are **not** sent to Telegram (they used to collapse to one message; they still delayed the main text).
 
 ### Windows
 

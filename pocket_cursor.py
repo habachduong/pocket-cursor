@@ -333,18 +333,13 @@ def _emit_confirmation(cid, text, buttons, btns_selector, sec_selector, tool_id)
     if rule_result == 'accept' and btns_selector:
         accept_idx, accept_label = command_rules.find_accept_button(buttons)
         if accept_idx is not None:
-            png = cdp_screenshot_element(sec_selector) if sec_selector else None
             click_result = _click_confirm_button(
                 btns_selector, accept_idx, accept_label or 'Run', tool_id
             )
             if click_result and str(click_result).startswith('OK'):
                 print(f"[command-rules] Auto-accepted: {text} -> {accept_label}")
                 if cid and not muted:
-                    if png:
-                        tg_send_photo_bytes(cid, png, filename='auto_accept.png',
-                                            caption=f"✅ Auto: {text}")
-                    else:
-                        tg_send(cid, f"✅ Auto: {text}")
+                    tg_send(cid, f"✅ Auto: {text}")
                 with pending_confirms_lock:
                     for k in (confirm_key, text_key, tool_id, _tg_confirm_key(tool_id)):
                         pending_confirms.pop(k, None)
@@ -353,7 +348,6 @@ def _emit_confirmation(cid, text, buttons, btns_selector, sec_selector, tool_id)
     if muted or not cid:
         return True
     tg_typing(cid)
-    png = cdp_screenshot_element(sec_selector) if sec_selector else None
     keyboard = []
     for btn in buttons or []:
         label = (btn.get('label') or f"Button {btn.get('index', 0)}")[:64]
@@ -363,14 +357,7 @@ def _emit_confirmation(cid, text, buttons, btns_selector, sec_selector, tool_id)
         }])
     sent_ok = False
     caption = f"⚡ {text}"
-    if png and keyboard:
-        print(f"[monitor] Forwarding CONFIRMATION with keyboard: {text}")
-        photo_result = tg_send_photo_bytes_with_keyboard(
-            cid, png, keyboard, filename='confirmation.png', caption=caption)
-        sent_ok = bool(photo_result and photo_result.get('ok'))
-        if sent_ok:
-            _remember_confirm_tg(confirm_key, photo_result, cid, caption, True)
-    if not sent_ok and keyboard:
+    if keyboard:
         print(f"[monitor] Forwarding CONFIRMATION as text: {text}")
         result = tg_call('sendMessage', chat_id=cid, text=caption,
                          reply_markup={'inline_keyboard': keyboard})
@@ -585,6 +572,14 @@ def _status_event_key(text):
     return t.lower()
 
 
+def _should_skip_telegram_section(sec_type, text):
+    """Thinking / Thought briefly / Waiting — never forward to Telegram."""
+    if sec_type == 'thinking':
+        return True
+    key = _status_event_key(text)
+    return key in ('status:thought', 'status:waiting')
+
+
 def tg_send_thinking(cid, text):
     """Send thinking text to Telegram in italic with 💭 prefix.
     Tries MarkdownV2 italic first, falls back to plain text if formatting fails.
@@ -679,6 +674,8 @@ def tg_send_photo_bytes_with_keyboard(cid, photo_bytes, keyboard, filename='scre
 POCKET_CURSOR_COMMANDS = [
     {'command': 'newchat', 'description': 'Start a new chat in Cursor'},
     {'command': 'chats', 'description': 'Show all chats across instances'},
+    {'command': 'mode', 'description': 'Switch Cursor Agent / Ask mode'},
+    {'command': 'ask', 'description': 'Switch Cursor to Ask mode'},
     {'command': 'pause', 'description': 'Pause Cursor to Telegram forwarding'},
     {'command': 'play', 'description': 'Resume forwarding'},
     {'command': 'screenshot', 'description': 'Screenshot your Cursor window'},
@@ -1797,6 +1794,197 @@ def cursor_send_message(text, raw=False):
     return result
 
 
+_MODE_DISPLAY = {
+    'agent': 'Agent',
+    'chat': 'Ask',
+    'ask': 'Ask',
+    'plan': 'Plan',
+    'debug': 'Debug',
+    'triage': 'Triage',
+    'spec': 'Spec',
+    'project': 'Project',
+    'multitask': 'Multitask',
+}
+
+
+def _normalize_mode_id(name):
+    """Map user/Telegram names to Cursor data-mode ids (Ask is 'chat')."""
+    n = (name or '').strip().lower()
+    if n in ('ask', 'chat', 'question'):
+        return 'chat'
+    if n in ('agent', 'edit', 'composer'):
+        return 'agent'
+    return n
+
+
+def cursor_mode_label(mode_id):
+    if not mode_id:
+        return '?'
+    return _MODE_DISPLAY.get(mode_id, mode_id)
+
+
+def cursor_get_mode():
+    """Read the current Agent/Ask/… mode from the composer mode picker."""
+    return cdp_eval("""
+        (function() {
+            const dd = document.querySelector('.composer-unified-dropdown[data-mode]')
+                    || document.querySelector('.composer-bar-input-buttons[data-mode]');
+            return dd ? (dd.getAttribute('data-mode') || '') : '';
+        })();
+    """) or ''
+
+
+def _cdp_click_selector(selector, conn=None):
+    """Click an element's center via CDP mouse events (VS Code often ignores element.click())."""
+    c = conn or active_conn()
+    pos = cdp_eval_on(c, f"""
+        (() => {{
+            const el = document.querySelector({json.dumps(selector)});
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) return null;
+            return JSON.stringify({{x: r.x + r.width/2, y: r.y + r.height/2}});
+        }})();
+    """)
+    if not pos:
+        return False
+    box = json.loads(pos)
+    x, y = int(box['x']), int(box['y'])
+    _cdp_cmd(c, 'Input.dispatchMouseEvent', {'type': 'mouseMoved', 'x': x, 'y': y})
+    _cdp_cmd(c, 'Input.dispatchMouseEvent', {
+        'type': 'mousePressed', 'x': x, 'y': y, 'button': 'left', 'clickCount': 1
+    })
+    _cdp_cmd(c, 'Input.dispatchMouseEvent', {
+        'type': 'mouseReleased', 'x': x, 'y': y, 'button': 'left', 'clickCount': 1
+    })
+    return True
+
+
+def _cursor_click_mode_menu_item(label):
+    """After the mode dropdown is open, click the row whose first line is Agent/Ask/…"""
+    return cdp_eval(f"""
+        (function() {{
+            const want = {json.dumps(label)};
+            const skip = el => el.closest('.menubar') || el.closest('.titlebar-container');
+            const nodes = document.querySelectorAll('div, button, span, [role="menuitem"]');
+            let best = null;
+            let bestArea = Infinity;
+            for (const el of nodes) {{
+                if (skip(el)) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 40 || r.height < 14 || r.bottom < 0 || r.top > (window.innerHeight || 2000)) continue;
+                const raw = (el.innerText || el.getAttribute('aria-label') || '').trim();
+                const first = raw.split('\\n')[0].trim();
+                if (first !== want) continue;
+                const area = r.width * r.height;
+                // Prefer compact rows (the actual menu item, not a huge ancestor)
+                if (area < bestArea && r.height < 80) {{
+                    best = el;
+                    bestArea = area;
+                }}
+            }}
+            if (!best) return 'ERROR: menu item not found: ' + want;
+            best.click();
+            const row = best.closest('[role="menuitem"]') || best;
+            row.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true, cancelable: true, button: 0, view: window}}));
+            row.dispatchEvent(new MouseEvent('mouseup', {{bubbles: true, cancelable: true, button: 0, view: window}}));
+            row.click();
+            return 'CLICKED:' + want;
+        }})();
+    """)
+
+
+def _cursor_cycle_mode_hotkey(times=1):
+    """Shift+Tab from the chat input cycles Cursor modes."""
+    conn = active_conn()
+    focus = cdp_eval_on(conn, """
+        (function() {
+            let editor = document.querySelector('.aislash-editor-input');
+            if (!editor) {
+                const all = document.querySelectorAll('[data-lexical-editor="true"]');
+                for (const ed of all) {
+                    if (ed.contentEditable === 'true') { editor = ed; break; }
+                }
+            }
+            if (!editor) return 'ERROR: no editor';
+            editor.focus();
+            return 'OK';
+        })();
+    """)
+    if focus != 'OK':
+        return focus
+    for _ in range(times):
+        _cdp_cmd(conn, 'Input.dispatchKeyEvent', {
+            'type': 'keyDown', 'key': 'Shift', 'code': 'ShiftLeft',
+            'windowsVirtualKeyCode': 16, 'modifiers': 8
+        })
+        _cdp_cmd(conn, 'Input.dispatchKeyEvent', {
+            'type': 'keyDown', 'key': 'Tab', 'code': 'Tab',
+            'windowsVirtualKeyCode': 9, 'modifiers': 8
+        })
+        _cdp_cmd(conn, 'Input.dispatchKeyEvent', {
+            'type': 'keyUp', 'key': 'Tab', 'code': 'Tab',
+            'windowsVirtualKeyCode': 9, 'modifiers': 8
+        })
+        _cdp_cmd(conn, 'Input.dispatchKeyEvent', {
+            'type': 'keyUp', 'key': 'Shift', 'code': 'ShiftLeft',
+            'windowsVirtualKeyCode': 16, 'modifiers': 0
+        })
+        time.sleep(0.2)
+    return 'OK'
+
+
+def cursor_set_mode(target_name):
+    """Switch Cursor composer mode to Agent or Ask. Returns 'OK: …' or 'ERROR: …'."""
+    wanted = _normalize_mode_id(target_name)
+    if wanted not in ('agent', 'chat'):
+        return f'ERROR: unknown mode {target_name!r} (use agent or ask)'
+    label = cursor_mode_label(wanted)
+    current = cursor_get_mode()
+    if current == wanted:
+        return f'OK: already {label}'
+
+    state = cdp_eval("""
+        (function() {
+            const dd = document.querySelector('.composer-unified-dropdown');
+            if (!dd) return 'MISSING';
+            if (dd.classList.contains('disabled')) return 'DISABLED';
+            return 'OK';
+        })();
+    """)
+    if state == 'MISSING':
+        return 'ERROR: mode picker not found'
+    if state == 'DISABLED':
+        return 'ERROR: mode locked (Cursor is generating — wait or Stop first)'
+
+    opened = _cdp_click_selector('.composer-unified-dropdown')
+    if not opened:
+        clicked = cdp_eval("""
+            (function() {
+                const dd = document.querySelector('.composer-unified-dropdown');
+                if (!dd) return 'ERROR: no picker';
+                dd.click();
+                return 'OPENED';
+            })();
+        """)
+        if not clicked or str(clicked).startswith('ERROR'):
+            return clicked or 'ERROR: could not open mode menu'
+    time.sleep(0.35)
+    item = _cursor_click_mode_menu_item(label)
+    time.sleep(0.25)
+    if cursor_get_mode() == wanted:
+        return f'OK: {label}'
+
+    # Fallback: cycle Shift+Tab until data-mode matches
+    for _ in range(8):
+        if cursor_get_mode() == wanted:
+            return f'OK: {label}'
+        _cursor_cycle_mode_hotkey(1)
+        if cursor_get_mode() == wanted:
+            return f'OK: {label}'
+    return f'ERROR: still {cursor_mode_label(cursor_get_mode())} after trying to set {label} ({item})'
+
+
 def cursor_new_chat():
     """Click the '+' button to create a new chat tab. Returns 'OK' or error."""
     return cdp_eval("""
@@ -2369,6 +2557,23 @@ def sender_thread():
                                         text='Command menu skipped. You can always add commands later via /setcommands in @BotFather.')
                         continue
 
+                    if action == 'mode':
+                        target = _normalize_mode_id(tool_id)
+                        result = cursor_set_mode(target)
+                        label = cursor_mode_label(target)
+                        if result and str(result).startswith('OK'):
+                            tg_call('answerCallbackQuery', callback_query_id=cb_id, text=f'{label}')
+                            cb_msg = callback.get('message', {})
+                            if cb_msg:
+                                cur = cursor_mode_label(cursor_get_mode())
+                                tg_call('editMessageText', chat_id=cb_msg['chat']['id'],
+                                        message_id=cb_msg['message_id'],
+                                        text=f'Mode: {cur}')
+                        else:
+                            tg_call('answerCallbackQuery', callback_query_id=cb_id,
+                                    text=(result or 'Failed')[:180])
+                        continue
+
                     if action in ('agent', 'chat'):
                         # New format: chat:{instance_id}:{pc_id}
                         parts = cb_data.split(':', 2)
@@ -2608,7 +2813,7 @@ def sender_thread():
                     ]
                     if conv_name:
                         lines.append(f"💬 {conv_name}")
-                    lines.append("\n/newchat /chats /pause /play /screenshot /unpair")
+                    lines.append("\n/newchat /chats /mode /ask /pause /play /screenshot /unpair")
                     tg_send(cid, '\n'.join(lines))
                     continue
 
@@ -2662,7 +2867,36 @@ def sender_thread():
                     print(f"[sender] New chat: {result}")
                     continue
 
-                if text in ('/chats', '/agents', '/agent'):
+                if text in ('/mode', '/ask', '/agent') or text.startswith('/mode '):
+                    arg = ''
+                    if text.startswith('/mode '):
+                        arg = text.split(None, 1)[1]
+                    elif text == '/ask':
+                        arg = 'ask'
+                    elif text == '/agent':
+                        arg = 'agent'
+                    if not arg:
+                        cur = cursor_get_mode()
+                        cur_label = cursor_mode_label(cur)
+                        agent_mark = '✓ ' if cur == 'agent' else ''
+                        ask_mark = '✓ ' if cur == 'chat' else ''
+                        tg_call('sendMessage', chat_id=cid,
+                                text=f'Mode hiện tại: {cur_label}\nChọn Agent (sửa code) hoặc Ask (chỉ hỏi).',
+                                reply_markup={'inline_keyboard': [[
+                                    {'text': f'{agent_mark}Agent', 'callback_data': 'mode:agent'},
+                                    {'text': f'{ask_mark}Ask', 'callback_data': 'mode:ask'},
+                                ]]})
+                        print(f"[sender] Mode picker (current={cur})")
+                        continue
+                    result = cursor_set_mode(arg)
+                    print(f"[sender] Mode -> {arg}: {result}")
+                    if result and str(result).startswith('OK'):
+                        tg_send(cid, f"Mode: {cursor_mode_label(cursor_get_mode())}")
+                    else:
+                        tg_send(cid, result or 'Failed to switch mode')
+                    continue
+
+                if text in ('/chats', '/agents'):
                     grouped = {}
                     for iid, info in instance_registry.items():
                         convs = info.get('convs', {})
@@ -3049,6 +3283,14 @@ def monitor_thread():
                 if sec_key and sec_key in forwarded_ids:
                     continue
 
+                # Thinking / Thought briefly / Waiting: consume immediately so they
+                # do not block the main text (was adding ~3–4s per status bubble).
+                if _should_skip_telegram_section(sec_type, text):
+                    if sec_key:
+                        forwarded_ids.add(sec_key)
+                    print(f"[monitor] Skip thinking/status [{i}] {sec_type:12s}  id={short_id(sec_key)}")
+                    continue
+
                 # Check stability (keyed by ID — survives position shifts)
                 prev_text = prev_by_id.get(sec_key)
                 if text == prev_text:
@@ -3066,10 +3308,6 @@ def monitor_thread():
                         )
                         if later_confirm:
                             continue
-                    break
-
-                # Don't forward empty thinking — wait for content to load
-                if sec_type == 'thinking' and not text.strip():
                     break
 
                 sec_selector = sec.get('selector') if isinstance(sec, dict) else None
@@ -3133,14 +3371,6 @@ def monitor_thread():
                             prefix = '📝 ' if sec_type == 'file_edit' else ''
                             display_text = (file_path or text) if sec_type == 'file_edit' else text
                             tg_send(cid, f"{prefix}{display_text}")
-                    elif sec_type == 'thinking':
-                        skey = _status_event_key(text)
-                        if skey and skey == last_status_key:
-                            print(f"[monitor] Skipping duplicate THINKING ({len(text)} chars)")
-                        else:
-                            last_status_key = skey
-                            print(f"[monitor] Forwarding THINKING ({len(text)} chars)")
-                            tg_send_thinking(cid, text)
                     else:
                         # Check for [PHONE_OUTBOX:filename] marker
                         outbox_match = OUTBOX_MARKER_RE.search(text)
