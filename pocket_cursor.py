@@ -95,6 +95,7 @@ def _new_tg_session():
 
 
 # Long-poll getUpdates must not share a connection pool with sendMessage.
+# Sharing one pool queued Run/Skip behind a 30s poll (~20s delay on Windows).
 _tg_poll_session = _new_tg_session()
 _tg_send_session = _new_tg_session()
 
@@ -330,7 +331,11 @@ def _confirm_text_key(text):
 
 
 def _emit_confirmation(cid, text, buttons, btns_selector, sec_selector, tool_id):
-    """Send one pending Run/Skip card to Telegram. Returns True if newly emitted."""
+    """Send one pending Run/Skip card to Telegram. Returns True if newly emitted.
+
+    Tracks the card immediately, then sendMessage runs on a daemon thread so a
+    slow Telegram round-trip cannot stall the monitor (or hide the next card).
+    """
     raw_tool_id = (tool_id or '').split()[0].strip()
     text_key = _confirm_text_key(text)
     # Unstable / synthetic ids — key only by text so alternate extractors cannot double
@@ -450,6 +455,7 @@ def _save_active_chat(workspace, chat_name, pc_id):
 # ── Telegram helpers ─────────────────────────────────────────────────────────
 
 def tg_call(method, **params):
+    """Call Telegram Bot API. getUpdates uses a separate HTTP session/timeout."""
     sess = _tg_poll_session if method == 'getUpdates' else _tg_send_session
     if method == 'getUpdates':
         http_timeout = float(params.get('timeout') or 0) + 10
@@ -3012,6 +3018,7 @@ def _monitor_progress_key(iid, pc_id):
 
 
 def _turn_fp(text):
+    """Stable fingerprint so a recycled DOM message-id still matches the same prompt."""
     t = re.sub(r'\s+', ' ', (text or '').strip())
     if not t:
         return None
@@ -3067,6 +3074,7 @@ def monitor_thread():
         }
 
     def _remember_turn(tid, user_text):
+        """Keep forwarded_ids for this prompt so a later DOM flap does not replay Telegram."""
         snap = {
             'last_turn_id': tid,
             'forwarded_ids': set(forwarded_ids),
@@ -3090,6 +3098,7 @@ def monitor_thread():
             turn_progress.pop(next(iter(turn_progress)), None)
 
     def _lookup_turn(tid, user_text):
+        """Find a previously mirrored turn by DOM id or prompt fingerprint."""
         if tid and tid != 'turn:' and tid in turn_progress:
             return turn_progress[tid]
         fp = _turn_fp(user_text)
@@ -3282,6 +3291,8 @@ def monitor_thread():
                     continue
 
                 saved_turn = _lookup_turn(turn_id, user_full)
+                # Cursor virtualizes the transcript: the "last human" can briefly
+                # become an older prompt. Resume that turn instead of sending [PC] again.
                 if saved_turn:
                     print(f"[monitor] Resume turn (DOM flap): '{(user_full or '')[:50]}'")
                     _restore_turn(saved_turn)

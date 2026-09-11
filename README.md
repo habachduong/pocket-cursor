@@ -12,7 +12,7 @@ PocketCursor keeps them going. It connects your running Cursor to Telegram on yo
 
 [▶ Watch the demo video](https://www.youtube.com/watch?v=hK7GIbRTzYo)
 
-**This fork (Daniel Ha)** — Cursor 3.19 Run/Skip on Telegram (no duplicate cards), hide buttons after the command already ran, catch up the latest turn when you switch windows, collapse duplicate Thought/Waiting, Windows 11 CDP after Cursor auto-update (`wmic` removal). Details in [CHANGELOG.md](CHANGELOG.md).
+**This fork (Daniel Ha)** — faster Run/Skip (no typing wait), skip thinking on Telegram, no replay when the PC transcript virtualizes, Cursor 3.19 Run/Skip without duplicate cards, Windows 11 CDP after Cursor auto-update. Details in [CHANGELOG.md](CHANGELOG.md).
 
 ## Windows quick start (Cursor 3.19.x)
 

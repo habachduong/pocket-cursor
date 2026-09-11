@@ -30,8 +30,11 @@ Upstream: [qmHecker/pocket-cursor](https://github.com/qmHecker/pocket-cursor) (M
 - `start_pocket.bat`: one launcher — kill Cursor, wait for CDP port 9222, then start the Telegram bridge. Finds Node.js from a winget user install.
 - `start_bridge.bat`: look up winget Node on PATH; venv hint uses `python -m venv`.
 - Run/Skip on Telegram is **text + buttons only** (no markdown/card screenshot on each approval).
+- Send Run/Skip **as soon as the card appears** (no 2-tick stability wait, no `typing…`). `sendMessage` runs on its own thread.
+- Prefer IPv4 + a dedicated HTTP session so long-poll `getUpdates` cannot delay approvals (~20s IPv6 fallback on Windows).
 - `/mode`, `/ask`, `/agent`: switch Cursor Agent vs Ask from Telegram.
 - Do not forward thinking / `Thought briefly` / Waiting to Telegram, so the main reply is not blocked behind status bubbles.
+- Do not replay `[PC]` prompts or AI replies when Cursor virtualizes the transcript and the last visible human message jumps to an older turn.
 
 ### Cursor 3.19 agent UI
 
