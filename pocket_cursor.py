@@ -586,6 +586,9 @@ def tg_escape_markdown_v2(text):
 
 _STATUS_THOUGHT_RE = re.compile(r'^(thought|thinking)\b', re.I)
 _STATUS_WAITING_RE = re.compile(r'^(waited|waiting)\b', re.I)
+_PHONE_TURN_RE = re.compile(
+    r'^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]]+\]\s*\[Phone\]', re.I)
+_TURN_PROGRESS_MAX = 40
 
 
 def _collapse_status_text(text):
@@ -3008,6 +3011,27 @@ def _monitor_progress_key(iid, pc_id):
     return None
 
 
+def _turn_fp(text):
+    t = re.sub(r'\s+', ' ', (text or '').strip())
+    if not t:
+        return None
+    return 'txt:' + hashlib.sha256(t.encode('utf-8', 'replace')).hexdigest()[:16]
+
+
+def _copy_turn_progress(src):
+    out = {}
+    for k, v in (src or {}).items():
+        if not isinstance(v, dict):
+            continue
+        out[k] = {
+            **v,
+            'forwarded_ids': set(v.get('forwarded_ids') or ()),
+            'prev_by_id': dict(v.get('prev_by_id') or {}),
+            'section_stable': dict(v.get('section_stable') or {}),
+        }
+    return out
+
+
 def monitor_thread():
     global mirrored_chat
     print("[monitor] Starting Cursor monitor...")
@@ -3025,6 +3049,8 @@ def monitor_thread():
     marked_done = False         # Whether we've sent ✅ for this turn
     last_status_key = None      # Consecutive thought/waiting Telegram dedup
     chat_progress = {}          # {progress_key: snapshot} — catch up after unfocus
+    turn_progress = {}          # {turn_id or txt:fp: snapshot} — DOM virtualization flaps
+    last_user_full = ''
 
     def _snap_progress():
         return {
@@ -3036,7 +3062,50 @@ def monitor_thread():
             'section_stable': dict(section_stable),
             'marked_done': marked_done,
             'last_status_key': last_status_key,
+            'turn_progress': _copy_turn_progress(turn_progress),
+            'last_user_full': last_user_full,
         }
+
+    def _remember_turn(tid, user_text):
+        snap = {
+            'last_turn_id': tid,
+            'forwarded_ids': set(forwarded_ids),
+            'sent_this_turn': sent_this_turn,
+            'prev_by_id': dict(prev_by_id),
+            'section_stable': dict(section_stable),
+            'marked_done': marked_done,
+            'last_status_key': last_status_key,
+            'user_full': user_text or '',
+        }
+        keys = []
+        if tid and tid != 'turn:':
+            keys.append(tid)
+        fp = _turn_fp(user_text)
+        if fp:
+            keys.append(fp)
+        for k in keys:
+            turn_progress.pop(k, None)
+            turn_progress[k] = snap
+        while len(turn_progress) > _TURN_PROGRESS_MAX:
+            turn_progress.pop(next(iter(turn_progress)), None)
+
+    def _lookup_turn(tid, user_text):
+        if tid and tid != 'turn:' and tid in turn_progress:
+            return turn_progress[tid]
+        fp = _turn_fp(user_text)
+        if fp and fp in turn_progress:
+            return turn_progress[fp]
+        return None
+
+    def _restore_turn(saved):
+        nonlocal forwarded_ids, sent_this_turn, prev_by_id, section_stable
+        nonlocal marked_done, last_status_key
+        forwarded_ids = set(saved.get('forwarded_ids') or ())
+        sent_this_turn = saved.get('sent_this_turn', False)
+        prev_by_id = dict(saved.get('prev_by_id') or {})
+        section_stable = dict(saved.get('section_stable') or {})
+        marked_done = saved.get('marked_done', False)
+        last_status_key = saved.get('last_status_key')
 
     def _store_progress(iid, pc_id):
         key = _monitor_progress_key(iid, pc_id)
@@ -3143,6 +3212,8 @@ def monitor_thread():
                     section_stable = dict(saved['section_stable'])
                     marked_done = saved['marked_done']
                     last_status_key = saved.get('last_status_key')
+                    turn_progress = _copy_turn_progress(saved.get('turn_progress'))
+                    last_user_full = saved.get('last_user_full') or ''
                     initialized = True
                     n_new = sum(
                         1 for s in sections
@@ -3165,6 +3236,8 @@ def monitor_thread():
                     section_stable = {}
                     marked_done = False
                     last_status_key = None
+                    turn_progress = {}
+                    last_user_full = user_full or ''
                     last_turn_id = turn_id
                     last_conv = conv
                     last_mc_pcid = cur_pcid
@@ -3175,7 +3248,13 @@ def monitor_thread():
             last_mc_pcid = cur_pcid
             last_iid = cur_iid
 
+            if initialized and last_turn_id and (not turn_id or turn_id == 'turn:'):
+                continue
+
             if turn_id != last_turn_id:
+                if last_turn_id:
+                    _remember_turn(last_turn_id, last_user_full)
+
                 if not initialized:
                     print(f"[monitor] Init: '{user_full[:50]}', skipping {len(sections)} existing")
                     if not muted and conv:
@@ -3194,91 +3273,111 @@ def monitor_thread():
                     }
                     initialized = True
                     last_turn_id = turn_id
+                    last_user_full = user_full or ''
                     prev_by_id = {sec.get('id', ''): sec.get('text', '')
                                   for sec in sections if isinstance(sec, dict) and sec.get('id')}
                     section_stable = {}
+                    _remember_turn(turn_id, user_full)
                     _store_progress(cur_iid, cur_pcid)
                     continue
 
-                if not user_full:
-                    print(f"[monitor] user_full empty, polling (turn_id={short_id(turn_id)})...")
-                    for attempt in range(10):
-                        time.sleep(0.2)
-                        t = cursor_get_turn_info(cp)
-                        t_tid = t['turn_id']
-                        t_uf = t['user_full']
-                        if t_tid != turn_id:
-                            print(f"[monitor]   poll {attempt}: turn_id changed -> {short_id(t_tid)}, abort")
-                            break
-                        if t_uf:
-                            print(f"[monitor]   poll {attempt}: got '{t_uf[:40]}'")
-                            user_full = t_uf
-                            sections = t['sections'] or sections
-                            images = t.get('images') or images
-                            break
-                    else:
-                        print(f"[monitor]   poll exhausted, user_full still empty")
+                saved_turn = _lookup_turn(turn_id, user_full)
+                if saved_turn:
+                    print(f"[monitor] Resume turn (DOM flap): '{(user_full or '')[:50]}'")
+                    _restore_turn(saved_turn)
+                    last_turn_id = turn_id
+                    last_user_full = user_full or last_user_full
+                    # Fall through and only forward sections not already sent.
 
-                # Check if this came from Telegram or was typed directly in Cursor
-                with last_sent_lock:
-                    sent = last_sent_text
-                from_telegram = (sent and (
-                    sent[:30] in user_full
-                    or sent == '[photo]'
-                ))
+                else:
+                    if not user_full:
+                        print(f"[monitor] user_full empty, polling (turn_id={short_id(turn_id)})...")
+                        for attempt in range(10):
+                            time.sleep(0.2)
+                            t = cursor_get_turn_info(cp)
+                            t_tid = t['turn_id']
+                            t_uf = t['user_full']
+                            if t_tid != turn_id:
+                                print(f"[monitor]   poll {attempt}: turn_id changed -> {short_id(t_tid)}, abort")
+                                break
+                            if t_uf:
+                                print(f"[monitor]   poll {attempt}: got '{t_uf[:40]}'")
+                                user_full = t_uf
+                                sections = t['sections'] or sections
+                                images = t.get('images') or images
+                                break
+                        else:
+                            print(f"[monitor]   poll exhausted, user_full still empty")
+                        saved_turn = _lookup_turn(turn_id, user_full)
+                        if saved_turn:
+                            print(f"[monitor] Resume turn after poll: '{(user_full or '')[:50]}'")
+                            _restore_turn(saved_turn)
+                            last_turn_id = turn_id
+                            last_user_full = user_full or last_user_full
+                            # Fall through.
 
-                origin = "Telegram" if from_telegram else "Cursor"
-                print(f"[monitor] New turn ({origin}): '{user_full[:50]}'")
-                for idx, sec in enumerate(sections):
-                    if isinstance(sec, dict):
-                        print(f"  [{idx}] {sec.get('type', '?'):12s}  id={short_id(sec.get('id'))}")
+                    if not saved_turn:
+                        with last_sent_lock:
+                            sent = last_sent_text
+                        from_telegram = bool(sent and (
+                            sent[:30] in (user_full or '')
+                            or sent == '[photo]'
+                        )) or bool(_PHONE_TURN_RE.match(user_full or ''))
 
-                if CONTEXT_MONITOR and mirrored_chat:
-                    cur_pcid = mirrored_chat[1]
-                    prev_pct = _context_pcts.get(cur_pcid)
-                    ctx = get_context_pct(mc_conn)
-                    ann = _build_context_annotation(ctx, cur_pcid)
-                    if ctx is not None:
-                        _context_pcts[cur_pcid] = ctx
-                        chat_label = mirrored_chat[2] if mirrored_chat else cur_pcid
-                        _context_pct_names[cur_pcid] = chat_label
-                        _save_context_pcts(pc_id=cur_pcid, chat_name=chat_label)
-                        lines = [f"[context-monitor] {ctx}% used in '{chat_label}'"]
-                        for pid, pct in _context_pcts.items():
-                            name = _context_pct_names.get(pid, pid)
-                            if pid == cur_pcid:
-                                delta = ctx - prev_pct if prev_pct is not None else 0
-                                trend = " 📈" if delta > 0 else " 📉" if delta < 0 else ""
-                                lines.append(f"  {name}: {pct:.1f}%{trend}")
-                            else:
-                                lines.append(f"  {name}: {pct:.1f}%")
-                        print('\n'.join(lines))
-                    if ann:
-                        try:
-                            cursor_prefill_input(ann, conn=mc_conn)
-                            print(f"[context-monitor] Prefilled: {ann}")
-                        except Exception as e:
-                            print(f"[context-monitor] Failed to prefill: {e}")
+                        origin = "Telegram" if from_telegram else "Cursor"
+                        print(f"[monitor] New turn ({origin}): '{user_full[:50]}'")
+                        for idx, sec in enumerate(sections):
+                            if isinstance(sec, dict):
+                                print(f"  [{idx}] {sec.get('type', '?'):12s}  id={short_id(sec.get('id'))}")
 
-                if not from_telegram:
-                    if not muted and user_full:
-                        tg_send(cid, f"[PC] {user_full}")
+                        if CONTEXT_MONITOR and mirrored_chat:
+                            cur_pcid = mirrored_chat[1]
+                            prev_pct = _context_pcts.get(cur_pcid)
+                            ctx = get_context_pct(mc_conn)
+                            ann = _build_context_annotation(ctx, cur_pcid)
+                            if ctx is not None:
+                                _context_pcts[cur_pcid] = ctx
+                                chat_label = mirrored_chat[2] if mirrored_chat else cur_pcid
+                                _context_pct_names[cur_pcid] = chat_label
+                                _save_context_pcts(pc_id=cur_pcid, chat_name=chat_label)
+                                lines = [f"[context-monitor] {ctx}% used in '{chat_label}'"]
+                                for pid, pct in _context_pcts.items():
+                                    name = _context_pct_names.get(pid, pid)
+                                    if pid == cur_pcid:
+                                        delta = ctx - prev_pct if prev_pct is not None else 0
+                                        trend = " 📈" if delta > 0 else " 📉" if delta < 0 else ""
+                                        lines.append(f"  {name}: {pct:.1f}%{trend}")
+                                    else:
+                                        lines.append(f"  {name}: {pct:.1f}%")
+                                print('\n'.join(lines))
+                            if ann:
+                                try:
+                                    cursor_prefill_input(ann, conn=mc_conn)
+                                    print(f"[context-monitor] Prefilled: {ann}")
+                                except Exception as e:
+                                    print(f"[context-monitor] Failed to prefill: {e}")
 
-                        for img_url in images:
-                            local_path = vscode_url_to_path(img_url)
-                            if local_path and Path(local_path).exists():
-                                print(f"[monitor] Forwarding image: {Path(local_path).name}")
-                                tg_send_photo(cid, local_path, caption="[PC] attached image")
+                        if not from_telegram:
+                            if not muted and user_full:
+                                tg_send(cid, f"[PC] {user_full}")
 
-                forwarded_ids = set()
-                sent_this_turn = False
-                prev_by_id = {}
-                section_stable = {}
-                marked_done = False
-                last_status_key = None
-                last_turn_id = turn_id
-                _store_progress(cur_iid, cur_pcid)
-                continue
+                                for img_url in images:
+                                    local_path = vscode_url_to_path(img_url)
+                                    if local_path and Path(local_path).exists():
+                                        print(f"[monitor] Forwarding image: {Path(local_path).name}")
+                                        tg_send_photo(cid, local_path, caption="[PC] attached image")
+
+                        forwarded_ids = set()
+                        sent_this_turn = False
+                        prev_by_id = {}
+                        section_stable = {}
+                        marked_done = False
+                        last_status_key = None
+                        last_turn_id = turn_id
+                        last_user_full = user_full or ''
+                        _remember_turn(turn_id, user_full)
+                        _store_progress(cur_iid, cur_pcid)
+                        continue
 
             if not initialized:
                 continue
@@ -3474,6 +3573,8 @@ def monitor_thread():
                     print(f"[monitor] AI done — {len(forwarded_ids)} sections forwarded")
                     marked_done = True
 
+            last_user_full = user_full or last_user_full
+            _remember_turn(turn_id, user_full)
             _store_progress(cur_iid, cur_pcid)
 
         except Exception as e:
