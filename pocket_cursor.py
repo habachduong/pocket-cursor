@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import subprocess as sp
 import threading
 import time
@@ -40,6 +41,7 @@ from lib import command_rules
 
 # Third-party
 import requests
+from requests.adapters import HTTPAdapter
 import websocket
 from openai import OpenAI
 from PIL import Image
@@ -75,6 +77,26 @@ if not TOKEN:
     sys.exit(1)
 
 TG_API = f"https://api.telegram.org/bot{TOKEN}"
+
+# Windows often spends ~20s failing IPv6 before falling back to IPv4.
+try:
+    from urllib3.util import connection as _urllib3_connection
+    _urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
+except Exception:
+    pass
+
+
+def _new_tg_session():
+    sess = requests.Session()
+    adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
+    sess.mount('https://', adapter)
+    sess.mount('http://', adapter)
+    return sess
+
+
+# Long-poll getUpdates must not share a connection pool with sendMessage.
+_tg_poll_session = _new_tg_session()
+_tg_send_session = _new_tg_session()
 
 # OpenAI API for voice transcription (optional)
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
@@ -347,7 +369,6 @@ def _emit_confirmation(cid, text, buttons, btns_selector, sec_selector, tool_id)
 
     if muted or not cid:
         return True
-    tg_typing(cid)
     keyboard = []
     for btn in buttons or []:
         label = (btn.get('label') or f"Button {btn.get('index', 0)}")[:64]
@@ -355,18 +376,26 @@ def _emit_confirmation(cid, text, buttons, btns_selector, sec_selector, tool_id)
             'text': label or 'Run',
             'callback_data': f"btn_{btn['index']}:{confirm_key}"
         }])
-    sent_ok = False
     caption = f"⚡ {text}"
-    if keyboard:
-        print(f"[monitor] Forwarding CONFIRMATION as text: {text}")
-        result = tg_call('sendMessage', chat_id=cid, text=caption,
-                         reply_markup={'inline_keyboard': keyboard})
-        sent_ok = bool(result.get('ok'))
-        if sent_ok:
-            _remember_confirm_tg(confirm_key, result, cid, caption, False)
-    if not sent_ok:
-        print("[monitor] Confirmation keyboard rejected, sending text only")
+    if not keyboard:
         tg_send(cid, f"⚡ {text}\n\nBấm Run/Skip trên Cursor (Telegram không nhận được nút).")
+        return True
+
+    print(f"[monitor] Forwarding CONFIRMATION as text: {text}")
+
+    def _send_confirm():
+        try:
+            result = tg_call('sendMessage', chat_id=cid, text=caption,
+                             reply_markup={'inline_keyboard': keyboard})
+            if result.get('ok'):
+                _remember_confirm_tg(confirm_key, result, cid, caption, False)
+                return
+            print("[monitor] Confirmation keyboard rejected, sending text only")
+            tg_send(cid, f"⚡ {text}\n\nBấm Run/Skip trên Cursor (Telegram không nhận được nút).")
+        except Exception as e:
+            print(f"[monitor] Confirmation send error: {e}")
+
+    threading.Thread(target=_send_confirm, name='tg-confirm', daemon=True).start()
     return True
 
 
@@ -421,8 +450,22 @@ def _save_active_chat(workspace, chat_name, pc_id):
 # ── Telegram helpers ─────────────────────────────────────────────────────────
 
 def tg_call(method, **params):
-    resp = requests.post(f"{TG_API}/{method}", json=params, timeout=60)
-    result = resp.json()
+    sess = _tg_poll_session if method == 'getUpdates' else _tg_send_session
+    if method == 'getUpdates':
+        http_timeout = float(params.get('timeout') or 0) + 10
+    else:
+        http_timeout = (3.05, 12)
+    t0 = time.time()
+    try:
+        resp = sess.post(f"{TG_API}/{method}", json=params, timeout=http_timeout)
+        result = resp.json()
+    except Exception as e:
+        dt = time.time() - t0
+        print(f"[telegram] {method} failed after {dt:.2f}s: {e}")
+        return {'ok': False, 'description': str(e)}
+    dt = time.time() - t0
+    if method != 'getUpdates' and dt >= 1.0:
+        print(f"[telegram] {method} took {dt:.2f}s")
     if not result.get('ok'):
         desc = result.get('description', '?')
         code = result.get('error_code', '?')
@@ -3002,7 +3045,7 @@ def monitor_thread():
 
     while True:
         try:
-            time.sleep(1)
+            time.sleep(0.35)
 
             with chat_id_lock:
                 cid = chat_id
@@ -3240,13 +3283,6 @@ def monitor_thread():
             if not initialized:
                 continue
 
-            # Keep typing indicator alive while AI is generating
-            is_generating = cdp_eval("""
-                (function() { return !!document.querySelector('[data-stop-button="true"]'); })();
-            """)
-            if is_generating and not muted:
-                tg_typing(cid)
-
             # Log newly appeared bubbles (compare against previous tick)
             for i, sec in enumerate(sections):
                 if isinstance(sec, dict) and sec.get('id'):
@@ -3273,6 +3309,30 @@ def monitor_thread():
             # Walk sections in DOM order. Skip already-forwarded IDs.
             # Stop at the first un-forwarded section that isn't stable yet
             # (preserves sequential ordering for Telegram).
+            # Run/Skip first so streaming text / stability ticks cannot delay the card.
+            for i, sec in enumerate(sections):
+                if not isinstance(sec, dict) or sec.get('type') != 'confirmation':
+                    continue
+                sec_key = sec.get('id', '')
+                if sec_key and sec_key in forwarded_ids:
+                    continue
+                text = sec.get('text') or 'Pending approval'
+                tool_id = (sec.get('id') or '').split()[0].strip() or (sec_key or '').split()[0].strip()
+                emitted = _emit_confirmation(
+                    cid,
+                    text,
+                    sec.get('buttons') or [],
+                    sec.get('buttons_selector') or '',
+                    sec.get('selector') or '',
+                    tool_id,
+                )
+                if emitted:
+                    print(f"[monitor] Confirmation emitted from turn: {text[:60]}")
+                if sec_key:
+                    forwarded_ids.add(sec_key)
+                sent_this_turn = True
+                last_status_key = None
+
             for i, sec in enumerate(sections):
                 sec_key = sec.get('id', '') if isinstance(sec, dict) else ''
                 text = sec['text'] if isinstance(sec, dict) else sec
@@ -3298,42 +3358,35 @@ def monitor_thread():
                 else:
                     section_stable[sec_key] = 0
 
-                # Not stable yet — stop here, unless a later confirmation would get stuck behind
-                if section_stable.get(sec_key, 0) < STABLE_THRESHOLD:
-                    if sec_type != 'confirmation':
-                        later_confirm = any(
-                            isinstance(s, dict) and s.get('type') == 'confirmation'
-                            and (s.get('id') or '') not in forwarded_ids
-                            for s in sections[i + 1:]
-                        )
-                        if later_confirm:
-                            continue
+                # Run/Skip: send immediately — do not wait 2 stable ticks
+                if sec_type != 'confirmation' and section_stable.get(sec_key, 0) < STABLE_THRESHOLD:
+                    later_confirm = any(
+                        isinstance(s, dict) and s.get('type') == 'confirmation'
+                        and (s.get('id') or '') not in forwarded_ids
+                        for s in sections[i + 1:]
+                    )
+                    if later_confirm:
+                        continue
                     break
 
                 sec_selector = sec.get('selector') if isinstance(sec, dict) else None
 
                 if sec_type == 'confirmation':
-                    # Sole Telegram sender is _scan_pending_approvals. Turn walk only
-                    # consumes the section so ordering continues (avoids double TG msgs
-                    # when tool_id / caption text differ between the two extractors).
                     tool_id = (sec_id or '').split()[0].strip() or (sec_key or '').split()[0].strip()
-                    text_key = _confirm_text_key(text)
-                    confirm_key = (
-                        _tg_confirm_key(tool_id)
-                        if tool_id and not tool_id.startswith('gen:')
-                        else text_key
+                    emitted = _emit_confirmation(
+                        cid,
+                        text,
+                        sec.get('buttons') or [],
+                        sec.get('buttons_selector') or '',
+                        sec.get('selector') or '',
+                        tool_id,
                     )
-                    with pending_confirms_lock:
-                        already = _confirm_already_tracked(confirm_key, tool_id, text_key)
-                    if already:
-                        print(f"[monitor] Confirmation already sent (scan): {text[:60]}")
-                    else:
-                        print(f"[monitor] Confirmation pending scan emit: {text[:60]}")
+                    if emitted:
+                        print(f"[monitor] Confirmation emitted from turn: {text[:60]}")
                     last_status_key = None
 
                 elif not muted:
                     # Only send to Telegram when not muted
-                    tg_typing(cid)
                     if sec_type in ('table', 'file_edit', 'code_block', 'latex'):
                         last_status_key = None
                         file_path = None
